@@ -15,7 +15,28 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status: implementation (branch `Dev/STM32H5`).** The STM32H5 family is implemented: key load (software,
+> DHUK, BHK, DHUK XOR BHK), key wrap / unwrap (ECB, CBC and the CTR key-derivation variant), key sharing with the
+> AES peripheral (`SAes_Set_KeyShare`), the ECB / CBC / CTR data path and the GCM / GMAC / CCM init - header -
+> payload - final phase sequencing, using the real SAES register protocol of RM0481 chapter 38. CCM leaves the
+> RFC 3610 / NIST SP800-38C `B0` / `B1` block construction to the caller (the module drives `SAES_CR.GCMPH`
+> exactly as documented, it does not build the flags/nonce/length-prefix bytes itself - see `SAes.c`). The DMA
+> transfer mode is accepted by `SAes_Init` (`AES_CR_DMAINEN` / `AES_CR_DMAOUTEN` are wired) but the Gpdma channel
+> itself is not started by this implementation. Every `SAes_Set_*` operation of this implementation finishes
+> synchronously inside its call (see the deviation note in `SAes.c`) instead of the asynchronous flow described
+> below; the configured complete callback is still invoked. STM32H503/523/543/562/563/H5E4/H5E5 (no SAES
+> peripheral): every function checks `defined(SAES)` and returns `SAES_REQUEST_ERROR`. Unit tests
+> run (host, Unity/CMock/RegMem) on the 12 STM32H5 lines, 25 cases each; integration tests run on NUCLEO-H533RE
+> (the boards H503 and H563 have no SAES and ignore them). SAES_DINR/SAES_DOUTR are one physical register read/written four times per block
+> (RM0481, 38.8.3/38.8.4): RegMem traps register stores, not loads, so a host unit test cannot see four genuinely
+> different 32-bit words come back - the FIPS-197 / NIST SP800-38A known-answer byte sequences are therefore
+> proven on the real hardware by the integration tests (`ItTest_SAes.c`), the unit tests only prove the MSB-first
+> byte order with a single repeated word (see the note in `Test_SAes.c`). The key-sharing demo with the Aes module
+> could not be exercised end to end: `SAes_Set_KeyShare` only sets `SAES_CR.KMOD` / `KSHAREID` on its own
+> registers (the key itself travels over the dedicated hardware bus, never through a software blob, so there is
+> no cross-module data shape to align), and this is unit/integration-tested on the SAES side alone; the Aes
+> module's own `AES_KEY_SHARED` key source (`Aes_Types.h`) is explicitly marked "not implemented in this version"
+> in the Aes STM32H5 README, so the receiving side cannot be exercised yet regardless of this module's state.
 
 ---
 
@@ -92,7 +113,7 @@ master.
 
 | Family | Branch | Peripheral | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `SAES` on the lines with the crypto (STM32H533, H553, H573, H5F): 128 / 256-bit keys, ECB, CBC, CTR, GCM, GMAC, CCM, DHUK / BHK / XOR keys, wrapped-key and shared-key mode, protection against the side-channel attacks, security context enforcement | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `SAES` on H533, H553, H573, H5F4, H5F5 (confirmed from the CMSIS device headers): 128 / 256-bit keys, ECB, CBC, CTR, GCM, GMAC, CCM, DHUK / BHK / XOR keys, wrapped-key and shared-key mode, the SAES-side register sequencing of key sharing with AES. Security context mismatches surface as the hardware's own `KEIF` error (`SAes_Get_KeyState`), not a separate TrustZone code path - see the STM32H5 status note above. | implemented (CCM B0/B1 construction, Gpdma channel start, Aes-side key-share receive: not in this version) |
 | STM32U5 | `Dev/STM32U5` | `SAES` on the lines with the crypto | planned |
 | STM32U3 | `Dev/STM32U3` | device dependent | planned |
 | STM32F4, STM32F7, STM32G4, STM32H7, STM32L4 | `Dev/STM32F4` ... | no secure AES on the device - the module is a stub that returns `SAES_REQUEST_ERROR` | planned |
@@ -206,7 +227,7 @@ aesRequest.KeySource = AES_KEY_SHARED;                            /* Aes module:
 - **Nvic** - interrupt of the peripheral
 - **Gpdma** - DMA transfers of the input and the output data
 - **Aes** - the target of the key sharing
-- **Rng** - the SAES is hardware-linked with the random number generator and draws random numbers from it for the side-channel countermeasures, so the RNG has to be running (the module makes sure of it through the API of the Rng module and reports the RNG error of the SAES)
+- **Rng** - the SAES is hardware-linked with the random number generator and draws random numbers from it for the side-channel countermeasures, so the RNG has to be running (the module starts it through `Rng_Set_ExecActive` and reports the RNG error of the SAES; the Rng module has to be initialized with `Rng_Init` by the caller before `SAes_Init`)
 - **RAL (Register Abstraction Layer)** - used internally to access the registers
 
 All mandatory RCC, NVIC and DMA configurations are handled internally.
