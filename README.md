@@ -15,7 +15,35 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status (STM32H7, branch `Dev/STM32H7`): implemented.** Port of the STM32H5 module (with the DMA transfer mode of task
+> AB#2333 and the NPBLB fix of bug AB#2334) to the SAES of the STM32H7S3 / STM32H7S7 lines (Ral family STM32H7RS, RM0477
+> chapter 36 - the same register set and protocol as RM0481 chapter 38, compared register by register): key load
+> (software, DHUK, BHK, DHUK XOR BHK), key wrap / unwrap, key sharing, ECB / CBC / CTR / GCM / GMAC / CCM, the POLL / ISR /
+> DMA transfer modes. Every `SAes_Set_*` operation finishes synchronously inside its call (see `SAes.c`). The classic
+> STM32H7 lines and STM32H7R3 / STM32H7R7 have no SAES: every function checks `defined(SAES)` and returns
+> `SAES_REQUEST_ERROR`. The module compiles without warnings for the 22 STM32H7 lines, for the Cortex-M4 of the 6
+> dual-core lines and for the 4 STM32H7R / STM32H7S lines. Unit tests: 40 cases (Unity, CMock, RegMem, the DMA mode
+> with the Gpdma mocked); on STM32H7S7 39 pass, the lines without the SAES ignore the SAES cases. Integration tests:
+> 18 known-answer cases (POLL and DMA mode); the firmware builds for all 27 STM32H7 / H7R / H7S presets (STM32H7S3 /
+> H7S7 with `-DINTEGRATION_TEST_OPTIMIZATION=-Os`, 64 KB flash); NUCLEO-H723ZG, NUCLEO-H7A3ZI-Q and NUCLEO-H755ZI-Q
+> (no SAES) ignore all cases; the run on NUCLEO-H7S3L8 is pending (board not on the IT agent).
+>
+> **STM32H7 specifics:**
+>
+> - **Register names.** The STM32H7RS device headers define `SAES_TypeDef` with the bit names `SAES_CR_x`, `SAES_SR_x`,
+>   `SAES_ISR_x` (STM32H5: the `AES_TypeDef` / `AES_CR_x` names shared with the AES peripheral).
+> - **Key sharing with CRYP.** `SAES_CR.KSHAREID` = 0 selects the CRYP peripheral (RM0477 36.8.1): the share target is
+>   `SAES_SHARE_CRYP` (STM32H5: `SAES_SHARE_AES`).
+> - **No key protection bit.** The STM32H7S lines have no `SAES_CR.KEYPROT`: `SAes_Set_KeyLoad` with
+>   `sAes_KeyConfig_t.Protect = SAES_FUNCTION_ACTIVE` returns `SAES_REQUEST_ERROR`.
+> - **Not part of this version.** The application hardware key (AHK) and the DHUK XOR AHK sources (`SAES_CR.KEYSEL` 0x3
+>   / 0x5 of RM0477).
+> - **DMA transfer mode.** GPDMA1 channels of the Gpdma module (requests SAES_IN / SAES_OUT); HPDMA1 has no SAES request,
+>   `SAes_Init` rejects `sAes_Config_t.DmaPeriphId` = `GPDMA_PERIPH_2` (HPDMA1).
+>   RM0477 Table 90 lists the GPDMA1 request 4 as saes_out_dma and 5 as saes_in_dma, the LL header of the STM32H7RS
+>   (used by the Gpdma module) defines SAES_IN = 4 and SAES_OUT = 5; the integration tests in the DMA mode on a board with
+>   the SAES (NUCLEO-H7S3L8) decide.
+> - **Device errata.** ES0596 Rev 10 lists no SAES erratum (the earlier ones were resolved and removed).
 
 ---
 
@@ -92,10 +120,11 @@ master.
 
 | Family | Branch | Peripheral | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `SAES` on the lines with the crypto (STM32H533, H553, H573, H5F): 128 / 256-bit keys, ECB, CBC, CTR, GCM, GMAC, CCM, DHUK / BHK / XOR keys, wrapped-key and shared-key mode, protection against the side-channel attacks, security context enforcement | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `SAES` on H533, H553, H573, H5F4, H5F5 (confirmed from the CMSIS device headers): 128 / 256-bit keys, ECB, CBC, CTR, GCM, GMAC, CCM, DHUK / BHK / XOR keys, wrapped-key and shared-key mode, the SAES-side register sequencing of key sharing with AES. Security context mismatches surface as the hardware's own `KEIF` error (`SAes_Get_KeyState`), not a separate TrustZone code path - see the STM32H5 status note above. | implemented (CCM B0/B1 construction, Gpdma channel start, Aes-side key-share receive: not in this version) |
+| STM32H7 | `Dev/STM32H7` | `SAES` on STM32H7S3 / H7S7 (Ral family STM32H7RS, RM0477): as STM32H5, key sharing with the CRYP peripheral (`SAES_SHARE_CRYP`), no `KEYPROT`, no AHK sources. The classic STM32H7 lines and STM32H7R3 / H7R7 have no SAES: every function only returns `SAES_REQUEST_ERROR`. | implemented |
 | STM32U5 | `Dev/STM32U5` | `SAES` on the lines with the crypto | planned |
 | STM32U3 | `Dev/STM32U3` | device dependent | planned |
-| STM32F4, STM32F7, STM32G4, STM32H7, STM32L4 | `Dev/STM32F4` ... | no secure AES on the device - the module is a stub that returns `SAES_REQUEST_ERROR` | planned |
+| STM32F4, STM32F7, STM32G4, STM32L4 | `Dev/STM32F4` ... | no secure AES on the device - the module is a stub that returns `SAES_REQUEST_ERROR` | planned |
 
 A function without a meaning in a family stays in the interface, returns `SAES_REQUEST_ERROR` and suppresses the unused
 parameters (for example the hardware key sources of a device that has only the software key, the shared mode without the AES
@@ -206,7 +235,7 @@ aesRequest.KeySource = AES_KEY_SHARED;                            /* Aes module:
 - **Nvic** - interrupt of the peripheral
 - **Gpdma** - DMA transfers of the input and the output data
 - **Aes** - the target of the key sharing
-- **Rng** - the SAES is hardware-linked with the random number generator and draws random numbers from it for the side-channel countermeasures, so the RNG has to be running (the module makes sure of it through the API of the Rng module and reports the RNG error of the SAES)
+- **Rng** - the SAES is hardware-linked with the random number generator and draws random numbers from it for the side-channel countermeasures, so the RNG has to be running (the module starts it through `Rng_Set_ExecActive` and reports the RNG error of the SAES; the Rng module has to be initialized with `Rng_Init` by the caller before `SAes_Init`)
 - **RAL (Register Abstraction Layer)** - used internally to access the registers
 
 All mandatory RCC, NVIC and DMA configurations are handled internally.
