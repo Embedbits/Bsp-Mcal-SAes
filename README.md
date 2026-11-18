@@ -20,14 +20,20 @@ the implementation.
 > AES peripheral (`SAes_Set_KeyShare`), the ECB / CBC / CTR data path and the GCM / GMAC / CCM init - header -
 > payload - final phase sequencing, using the real SAES register protocol of RM0481 chapter 38. CCM leaves the
 > RFC 3610 / NIST SP800-38C `B0` / `B1` block construction to the caller (the module drives `SAES_CR.GCMPH`
-> exactly as documented, it does not build the flags/nonce/length-prefix bytes itself - see `SAes.c`). The DMA
-> transfer mode is accepted by `SAes_Init` (`AES_CR_DMAINEN` / `AES_CR_DMAOUTEN` are wired) but the Gpdma channel
-> itself is not started by this implementation. Every `SAes_Set_*` operation of this implementation finishes
+> exactly as documented, it does not build the flags/nonce/length-prefix bytes itself - see `SAes.c`). The partial last
+> block of a GCM payload encryption / CCM payload decryption sets `SAES_CR.NPBLB` (bug AB#2334). DMA transfer mode
+> (`SAES_XFER_MODE_DMA`, task AB#2333): `SAes_Init` initializes the Gpdma input channel (memory -> `SAES_DINR`, request
+> SAES_IN) and output channel (`SAES_DOUTR` -> memory, request SAES_OUT) of `sAes_Config_t` (default GPDMA1, channels 2 /
+> 3), 32-bit words with the bytes exchanged by the Gpdma; the full blocks of the payload and of the header (input
+> channel only) are moved by the DMA in chunks of at most 65520 bytes, the partial last block by the CPU; the buffers
+> of a full block must be 32-bit aligned (`SAES_REQUEST_ERROR` otherwise). Every `SAes_Set_*` operation of this
+> implementation finishes
 > synchronously inside its call (see the deviation note in `SAes.c`) instead of the asynchronous flow described
 > below; the configured complete callback is still invoked. STM32H503/523/543/562/563/H5E4/H5E5 (no SAES
 > peripheral): every function checks `defined(SAES)` and returns `SAES_REQUEST_ERROR`. Unit tests
-> run (host, Unity/CMock/RegMem) on the 12 STM32H5 lines, 25 cases each; integration tests run on NUCLEO-H533RE
-> (the boards H503 and H563 have no SAES and ignore them). SAES_DINR/SAES_DOUTR are one physical register read/written four times per block
+> run (host, Unity/CMock/RegMem, the Gpdma mocked) on the STM32H5 lines, 38 cases each; integration tests run on
+> NUCLEO-H533RE, 18 cases: the FIPS-197 / SP800-38A / GCM test case 3 and 4 known answers in the POLL and in the DMA
+> mode (the boards H503 and H563 have no SAES and ignore them). SAES_DINR/SAES_DOUTR are one physical register read/written four times per block
 > (RM0481, 38.8.3/38.8.4): RegMem traps register stores, not loads, so a host unit test cannot see four genuinely
 > different 32-bit words come back - the FIPS-197 / NIST SP800-38A known-answer byte sequences are therefore
 > proven on the real hardware by the integration tests (`ItTest_SAes.c`), the unit tests only prove the MSB-first

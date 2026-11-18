@@ -19,10 +19,12 @@ UnitTesting_Add_Test(
     MOCK_HEADERS    ${MCAL_DIR}/Rcc/Rcc_Port.h
                     ${MCAL_DIR}/Nvic/Nvic_Port.h
                     ${MCAL_DIR}/Rng/Rng_Port.h
+                    ${MCAL_DIR}/Gpdma/Gpdma_Port.h
     INCLUDE_DIRS    ${SAES_DIR}
                     ${MCAL_DIR}/Rcc
                     ${MCAL_DIR}/Nvic
                     ${MCAL_DIR}/Rng
+                    ${MCAL_DIR}/Gpdma
     LINK_LIBS       ut_RegMem                           # Registers in host memory
                     ut_CmsisHost                        # CMSIS core intrinsics on host
     FORCE_INCLUDES  ${UNIT_TESTING_CMSIS_HOST_HEADER}   # Replaces cmsis_gcc.h

@@ -10,8 +10,11 @@
  * runs on every line, with the no-SAES body replaced by `TEST_IGNORE_MESSAGE` (the pattern
  * used by the Pka / Cec module tests), except
  * \ref Ut_SAes_NoPeripheral_EveryFunctionReturnsError which runs only there. RCC (peripheral
- * clock), NVIC (interrupt line) and RNG (side-channel countermeasures) are mocked by CMock,
- * the SAES registers are emulated by RegMem.
+ * clock), NVIC (interrupt line), RNG (side-channel countermeasures) and Gpdma (channels of the DMA
+ * transfer mode) are mocked by CMock, the SAES registers are emulated by RegMem. The Gpdma stubs
+ * capture the configuration of the channels and call the transfer complete (or the error) interrupt
+ * of the module when its input channel is started - the data itself is not moved, the tests check
+ * the channel parameters, the order of the steps and the split between the DMA and the CPU.
  *
  * A HW model (UtSAes_HwModel, only compiled where SAES is defined) sets SAES_SR.KEYVALID
  * as soon as SAES_CR.KEYSEL is non-zero and SAES_ISR.CCF while SAES_CR.EN is set (RegMem is
@@ -38,6 +41,7 @@
 #include "MockRcc_Port.h"                   /* RCC module mock                */
 #include "MockNvic_Port.h"                  /* NVIC module mock                */
 #include "MockRng_Port.h"                   /* RNG module mock                */
+#include "MockGpdma_Port.h"                 /* Gpdma module mock              */
 #include "Stm32.h"                          /* SAES registers definition      */
 /* ============================= TYPEDEFS =================================== */
 
@@ -47,6 +51,39 @@
 static void UtSAes_HwModel( void );
 static void UtSAes_Expect_InitPoll( void );
 static void UtSAes_Init_Poll( void );
+static void UtSAes_Init_Dma( void );
+static void UtSAes_Set_DmaStubs( void );
+static void UtSAes_Set_DmaRequest( sAes_Request_t * const request,
+                                   sAes_Mode_t            mode,
+                                   const sAes_Data_t *    input,
+                                   sAes_Data_t *          output,
+                                   sAes_DataLen_t         dataLen );
+static gpdma_RequestState_t UtSAes_GpdmaDefaultStub( gpdma_ConfigStruct_t * configStruct, int callCnt );
+static gpdma_RequestState_t UtSAes_GpdmaInitStub   ( gpdma_ConfigStruct_t * configStruct, int callCnt );
+static gpdma_RequestState_t UtSAes_GpdmaSizeStub   ( gpdma_PeriphId_t  periphId,
+                                                     gpdma_ChannelId_t channelId,
+                                                     gpdma_BlockSize_t blockSize,
+                                                     int               callCnt );
+static gpdma_RequestState_t UtSAes_GpdmaSrcStub    ( gpdma_PeriphId_t  periphId,
+                                                     gpdma_ChannelId_t channelId,
+                                                     gpdma_SrcAddr_t   sourceAddr,
+                                                     int               callCnt );
+static gpdma_RequestState_t UtSAes_GpdmaDstStub    ( gpdma_PeriphId_t  periphId,
+                                                     gpdma_ChannelId_t channelId,
+                                                     gpdma_DstAddr_t   destAddr,
+                                                     int               callCnt );
+static gpdma_RequestState_t UtSAes_GpdmaStartStub  ( gpdma_PeriphId_t  periphId,
+                                                     gpdma_ChannelId_t channelId,
+                                                     int               callCnt );
+static gpdma_RequestState_t UtSAes_GpdmaStopStub   ( gpdma_PeriphId_t  periphId,
+                                                     gpdma_ChannelId_t channelId,
+                                                     int               callCnt );
+static void UtSAes_Set_AeadRequest( sAes_Request_t * const request,
+                                    sAes_Operation_t       operation,
+                                    sAes_Mode_t            mode,
+                                    const sAes_Data_t *    input,
+                                    sAes_Data_t *          output,
+                                    sAes_Data_t *          tag );
 #endif /* SAES */
 
 /* ========================= SYMBOLIC CONSTANTS ============================= */
@@ -104,6 +141,57 @@ static void UtSAes_Init_Poll( void );
 #define UT_SAES_FIPS197_C2_CIPHERTEXT_WORD0    ( 0xDDA97CA4uL )
 #define UT_SAES_FIPS197_C3_CIPHERTEXT_WORD0    ( 0x8EA2B7CAuL )
 #define UT_SAES_SP38A_CBC_CIPHERTEXT_WORD0     ( 0x7649ABACuL )
+
+/** RM0481, 38.8.1: SAES_CR.NPBLB[3:0] at bits 23:20 */
+#define UT_SAES_CR_NPBLB_MASK                 ( 0xFuL << 20 )
+
+/** Payload of the NPBLB tests: one full block and a partial last block of 4 bytes (12 padding bytes) */
+#define UT_SAES_PARTIAL_LEN                   ( 20u )
+#define UT_SAES_CR_NPBLB_12                   ( 0xCuL << 20 )
+
+/** Gpdma channels of the default configuration of the DMA mode (input, output) */
+#define UT_SAES_DMA_IN_CH                     ( GPDMA_CHANNEL_2 )
+#define UT_SAES_DMA_OUT_CH                    ( GPDMA_CHANNEL_3 )
+
+/** Count of the Gpdma channels of the DMA mode (input, output) and the index of each in the captured configs */
+#define UT_SAES_DMA_CHANNEL_CNT               ( 2u )
+#define UT_SAES_DMA_CFG_IN                    ( 0u )
+#define UT_SAES_DMA_CFG_OUT                   ( 1u )
+
+/** Started channels of the two-chunk test (output + input per chunk) and the log entries of its second chunk */
+#define UT_SAES_DMA_TWO_CHUNK_STARTS          ( 4u )
+#define UT_SAES_DMA_LOG_CHUNK1_IN             ( 1u )
+#define UT_SAES_DMA_LOG_CHUNK2_OUT            ( 2u )
+#define UT_SAES_DMA_LOG_CHUNK2_IN             ( 3u )
+
+/** Size of the logs of the Gpdma stubs (calls per test) */
+#define UT_SAES_DMA_LOG_MAX                   ( 8u )
+
+/** Payload of the chunk test: one full chunk of the module (65520 bytes) and one more block */
+#define UT_SAES_DMA_CHUNK_MAX                 ( 65520u )
+#define UT_SAES_DMA_BIG_LEN                   ( UT_SAES_DMA_CHUNK_MAX + SAES_BLOCK_BYTES )
+
+/** Word count of the buffers of the DMA tests */
+#define UT_SAES_DMA_WORDS                     ( UT_SAES_DMA_BIG_LEN / UT_SAES_REG_BYTES_PER_WORD32 )
+
+/** Value preset in SAES_DOUTR: the CPU reads it for the partial last block (MSB first) */
+#define UT_SAES_DOUTR_PATTERN                 ( 0xA1B2C3D4uL )
+
+/** First bytes of the output of a block read by the CPU from \ref UT_SAES_DOUTR_PATTERN */
+#define UT_SAES_DOUTR_BYTE0                   ( 0xA1u )
+#define UT_SAES_DOUTR_BYTE3                   ( 0xD4u )
+
+/** Payload of the CPU tail test: one block by the DMA, 4 bytes by the CPU */
+#define UT_SAES_TAIL_LEN                      ( 20u )
+
+/** Byte offset which makes a buffer not word aligned */
+#define UT_SAES_UNALIGNED_OFFSET              ( 1u )
+
+/** Two blocks of the ECB and the header tests */
+#define UT_SAES_TWO_BLOCKS_LEN                ( 32u )
+
+/** Mask of the DMA request bits of SAES_CR (RM0481, 38.8.1: DMAOUTEN bit 12, DMAINEN bit 11) */
+#define UT_SAES_CR_DMA_MASK                   ( 0x3uL << 11 )
 
 /** CTR counter value expected in SAES_IVR0 after processing (RM0481, Table 372: starts at 1) */
 #define UT_SAES_CTR_COUNTER_AFTER_PROCESS      ( 0x00000001uL )
@@ -187,6 +275,63 @@ static const sAes_Data_t utSAes_Sp38a_CbcCiphertext[ SAES_BLOCK_BYTES ]   = { UT
 /* ========================== EXPORTED VARIABLES ============================= */
 
 /* =========================== LOCAL VARIABLES ============================== */
+
+#if defined(SAES)
+
+/** \brief One call of a Gpdma stub: the channel and its value */
+typedef struct
+{
+    gpdma_ChannelId_t ChannelId; /**< Channel of the call */
+    uint32_t          Value;     /**< Block size or address */
+}   utSAes_DmaLogItem_t;
+
+/** \brief Configuration of a channel captured by \ref UtSAes_GpdmaInitStub */
+typedef struct
+{
+    gpdma_ChannelId_t     ChannelId;      /**< Channel                         */
+    gpdma_Direction_t     Direction;      /**< Direction of the transfer       */
+    gpdma_PeriphReqId_t   RequestSource;  /**< Hardware request               */
+    gpdma_DataSize_t      SrcDataSize;    /**< Source data width              */
+    gpdma_DataSize_t      DstDataSize;    /**< Destination data width         */
+    gpdma_AddrMode_t      SrcAddrMode;    /**< Source address mode            */
+    gpdma_AddrMode_t      DstAddrMode;    /**< Destination address mode       */
+    gpdma_DestDataOp_t    DstDataOp;      /**< Byte exchange of the destination */
+    gpdma_SrcAddr_t       SrcAddr;        /**< Source address of the init     */
+    gpdma_DstAddr_t       DstAddr;        /**< Destination address of the init */
+}   utSAes_DmaChannelCfg_t;
+
+/** Configurations captured by Gpdma_Init: [0] input channel, [1] output channel */
+static utSAes_DmaChannelCfg_t utSAes_DmaCfg[ UT_SAES_DMA_CHANNEL_CNT ];
+static uint32_t               utSAes_DmaInitCnt;
+
+/** Interrupts of the module captured by Gpdma_Init */
+static gpdma_IsrCallback     *utSAes_DmaInIsr;
+static gpdma_IsrCallback     *utSAes_DmaOutIsr;
+static gpdma_IsrErrCallback  *utSAes_DmaErrIsr;
+
+/** Logs of the block sizes, the addresses, the started and the stopped channels */
+static utSAes_DmaLogItem_t    utSAes_DmaSizeLog[ UT_SAES_DMA_LOG_MAX ];
+static uint32_t               utSAes_DmaSizeCnt;
+static utSAes_DmaLogItem_t    utSAes_DmaSrcLog[ UT_SAES_DMA_LOG_MAX ];
+static uint32_t               utSAes_DmaSrcCnt;
+static utSAes_DmaLogItem_t    utSAes_DmaDstLog[ UT_SAES_DMA_LOG_MAX ];
+static uint32_t               utSAes_DmaDstCnt;
+static gpdma_ChannelId_t      utSAes_DmaStartLog[ UT_SAES_DMA_LOG_MAX ];
+static uint32_t               utSAes_DmaStartCnt;
+static gpdma_ChannelId_t      utSAes_DmaStopLog[ UT_SAES_DMA_LOG_MAX ];
+static uint32_t               utSAes_DmaStopCnt;
+
+/** \ref UtSAes_GpdmaStartStub reports a Gpdma error instead of the transfer complete */
+static sAes_FunctionState_t   utSAes_DmaFail;
+
+/** Value of SAES_CR.DMAINEN / DMAOUTEN when the input channel was started (requests set after the start) */
+static uint32_t               utSAes_DmaCrAtStart;
+
+/** Word-aligned buffers of the DMA tests */
+static uint32_t               utSAes_DmaIn[ UT_SAES_DMA_WORDS ];
+static uint32_t               utSAes_DmaOut[ UT_SAES_DMA_WORDS ];
+
+#endif /* SAES */
 
 /* ============================ TEST FIXTURE ================================ */
 
@@ -755,6 +900,435 @@ void Ut_SAes_Set_Process_CcmEncryptNoAadNoPayload_SetsChmodBit16NotBit7( void )
 
 
 /**
+ * \brief   SAes_Set_Process() GCM/encrypt with a partial last payload block writes the count of its padding bytes
+ *          to SAES_CR.NPBLB (RM0481 SAES_CR.NPBLB: the tag is wrong otherwise).
+ *
+ * \par Expected results
+ * - SAES_REQUEST_OK, SAES_CR.NPBLB = 12 (a 20-byte payload: 4 valid bytes in the last block).
+ */
+void Ut_SAes_Set_Process_GcmEncryptPartialLastBlock_SetsNpblb( void )
+{
+#if defined(SAES)
+    static const sAes_Data_t input[ UT_SAES_PARTIAL_LEN ] = { 0u };
+    sAes_Data_t              output[ UT_SAES_PARTIAL_LEN ];
+    sAes_Data_t              tag[ SAES_BLOCK_BYTES ];
+    sAes_Request_t           request;
+
+    UtSAes_Init_Poll();
+    UtSAes_Set_AeadRequest( &request, SAES_OPERATION_ENCRYPT, SAES_MODE_GCM, input, output, tag );
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Set_Process( &request ) );
+    TEST_ASSERT_EQUAL_HEX32( UT_SAES_CR_NPBLB_12, ( SAES->CR & UT_SAES_CR_NPBLB_MASK ) );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   SAes_Set_Process() GCM/decrypt with a partial last payload block leaves SAES_CR.NPBLB clear (the tag is
+ *          computed over the zero-padded ciphertext block, RM0481 SAES_CR.NPBLB).
+ *
+ * \par Expected results
+ * - SAES_REQUEST_OK, SAES_CR.NPBLB = 0.
+ */
+void Ut_SAes_Set_Process_GcmDecryptPartialLastBlock_LeavesNpblbClear( void )
+{
+#if defined(SAES)
+    static const sAes_Data_t input[ UT_SAES_PARTIAL_LEN ] = { 0u };
+    sAes_Data_t              output[ UT_SAES_PARTIAL_LEN ];
+    sAes_Data_t              tag[ SAES_BLOCK_BYTES ];
+    sAes_Request_t           request;
+
+    UtSAes_Init_Poll();
+    UtSAes_Set_AeadRequest( &request, SAES_OPERATION_DECRYPT, SAES_MODE_GCM, input, output, tag );
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Set_Process( &request ) );
+    TEST_ASSERT_EQUAL_HEX32( 0u, ( SAES->CR & UT_SAES_CR_NPBLB_MASK ) );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   SAes_Set_Process() CCM/decrypt with a partial last payload block writes the count of its padding bytes
+ *          to SAES_CR.NPBLB (RM0481 SAES_CR.NPBLB).
+ *
+ * \par Expected results
+ * - SAES_REQUEST_OK, SAES_CR.NPBLB = 12.
+ */
+void Ut_SAes_Set_Process_CcmDecryptPartialLastBlock_SetsNpblb( void )
+{
+#if defined(SAES)
+    static const sAes_Data_t input[ UT_SAES_PARTIAL_LEN ] = { 0u };
+    sAes_Data_t              output[ UT_SAES_PARTIAL_LEN ];
+    sAes_Data_t              tag[ SAES_BLOCK_BYTES ];
+    sAes_Request_t           request;
+
+    UtSAes_Init_Poll();
+    UtSAes_Set_AeadRequest( &request, SAES_OPERATION_DECRYPT, SAES_MODE_CCM, input, output, tag );
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Set_Process( &request ) );
+    TEST_ASSERT_EQUAL_HEX32( UT_SAES_CR_NPBLB_12, ( SAES->CR & UT_SAES_CR_NPBLB_MASK ) );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   The next request clears SAES_CR.NPBLB left by a GCM encryption with a partial last block.
+ *
+ * \par Expected results
+ * - After the GCM request SAES_CR.NPBLB = 12, after the following ECB request of one block SAES_CR.NPBLB = 0.
+ */
+void Ut_SAes_Set_Process_AfterPartialGcmEncrypt_NextRequestClearsNpblb( void )
+{
+#if defined(SAES)
+    static const sAes_Data_t input[ UT_SAES_PARTIAL_LEN ] = { 0u };
+    sAes_Data_t              output[ UT_SAES_PARTIAL_LEN ];
+    sAes_Data_t              tag[ SAES_BLOCK_BYTES ];
+    sAes_Request_t           request;
+
+    UtSAes_Init_Poll();
+    UtSAes_Set_AeadRequest( &request, SAES_OPERATION_ENCRYPT, SAES_MODE_GCM, input, output, tag );
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Set_Process( &request ) );
+    TEST_ASSERT_EQUAL_HEX32( UT_SAES_CR_NPBLB_12, ( SAES->CR & UT_SAES_CR_NPBLB_MASK ) );
+
+    request.Mode    = SAES_MODE_ECB;
+    request.Iv      = SAES_NULL_PTR;
+    request.DataLen = SAES_BLOCK_BYTES;
+    request.Tag     = SAES_NULL_PTR;
+    request.TagLen  = 0u;
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Set_Process( &request ) );
+    TEST_ASSERT_EQUAL_HEX32( 0u, ( SAES->CR & UT_SAES_CR_NPBLB_MASK ) );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+/**
+ * \brief   SAes_Init() in the DMA mode initializes the input and the output Gpdma channel and their interrupts.
+ *
+ * \par Expected results
+ * - SAES_REQUEST_OK; the default configuration holds GPDMA1, channels 2 / 3, the low priority.
+ * - Input channel 2: memory -> peripheral, request SAES_IN, destination SAES_DINR (static), source incremented.
+ * - Output channel 3: peripheral -> memory, request SAES_OUT, source SAES_DOUTR (static), destination incremented.
+ * - Both: 32-bit words, the bytes of every word exchanged on the destination side, interrupts activated.
+ */
+void Ut_SAes_Init_DmaMode_ConfiguresInputAndOutputChannel( void )
+{
+#if defined(SAES)
+    sAes_Config_t config;
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Get_DefaultConfig( &config ) );
+    TEST_ASSERT_EQUAL( GPDMA_PERIPH_1, config.DmaPeriphId );
+    TEST_ASSERT_EQUAL( UT_SAES_DMA_IN_CH, config.DmaInChannelId );
+    TEST_ASSERT_EQUAL( UT_SAES_DMA_OUT_CH, config.DmaOutChannelId );
+    TEST_ASSERT_EQUAL( GPDMA_PRIORITY_LOW, config.DmaChannelPrio );
+
+    UtSAes_Init_Dma();
+
+    TEST_ASSERT_EQUAL_UINT32( UT_SAES_DMA_CHANNEL_CNT, utSAes_DmaInitCnt );
+    TEST_ASSERT_EQUAL( UT_SAES_DMA_IN_CH, utSAes_DmaCfg[ UT_SAES_DMA_CFG_IN ].ChannelId );
+    TEST_ASSERT_EQUAL( GPDMA_DIR_MEMORY_TO_PERIPH, utSAes_DmaCfg[ UT_SAES_DMA_CFG_IN ].Direction );
+    TEST_ASSERT_EQUAL( GPDMA_REQ_SAES_IN, utSAes_DmaCfg[ UT_SAES_DMA_CFG_IN ].RequestSource );
+    TEST_ASSERT_EQUAL( GPDMA_ADDR_INCREMENT, utSAes_DmaCfg[ UT_SAES_DMA_CFG_IN ].SrcAddrMode );
+    TEST_ASSERT_EQUAL( GPDMA_ADDR_STATIC, utSAes_DmaCfg[ UT_SAES_DMA_CFG_IN ].DstAddrMode );
+    TEST_ASSERT_EQUAL_HEX32( (uint32_t)(uintptr_t)&SAES->DINR, utSAes_DmaCfg[ UT_SAES_DMA_CFG_IN ].DstAddr );
+
+    TEST_ASSERT_EQUAL( UT_SAES_DMA_OUT_CH, utSAes_DmaCfg[ UT_SAES_DMA_CFG_OUT ].ChannelId );
+    TEST_ASSERT_EQUAL( GPDMA_DIR_PERIPH_TO_MEMORY, utSAes_DmaCfg[ UT_SAES_DMA_CFG_OUT ].Direction );
+    TEST_ASSERT_EQUAL( GPDMA_REQ_SAES_OUT, utSAes_DmaCfg[ UT_SAES_DMA_CFG_OUT ].RequestSource );
+    TEST_ASSERT_EQUAL( GPDMA_ADDR_STATIC, utSAes_DmaCfg[ UT_SAES_DMA_CFG_OUT ].SrcAddrMode );
+    TEST_ASSERT_EQUAL( GPDMA_ADDR_INCREMENT, utSAes_DmaCfg[ UT_SAES_DMA_CFG_OUT ].DstAddrMode );
+    TEST_ASSERT_EQUAL_HEX32( (uint32_t)(uintptr_t)&SAES->DOUTR, utSAes_DmaCfg[ UT_SAES_DMA_CFG_OUT ].SrcAddr );
+
+    for( uint32_t idx = 0u; UT_SAES_DMA_CHANNEL_CNT > idx; idx++ )
+    {
+        TEST_ASSERT_EQUAL( GPDMA_DATA_SIZE_32BITS, utSAes_DmaCfg[ idx ].SrcDataSize );
+        TEST_ASSERT_EQUAL( GPDMA_DATA_SIZE_32BITS, utSAes_DmaCfg[ idx ].DstDataSize );
+        TEST_ASSERT_EQUAL( GPDMA_DEST_DATA_BYTE_2BYTES_SWAP, utSAes_DmaCfg[ idx ].DstDataOp );
+    }
+
+    TEST_ASSERT_NOT_NULL( utSAes_DmaInIsr );
+    TEST_ASSERT_NOT_NULL( utSAes_DmaOutIsr );
+    TEST_ASSERT_NOT_NULL( utSAes_DmaErrIsr );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   SAes_Init() in the DMA mode rejects the same channel for the input and the output and rolls back.
+ *
+ * \par Expected results
+ * - SAES_REQUEST_ERROR, no Gpdma channel is initialized, the Deinit rollback disables the NVIC line and the clock.
+ */
+void Ut_SAes_Init_DmaModeSameChannels_ReturnsErrorAndDeinitializes( void )
+{
+#if defined(SAES)
+    sAes_Config_t config;
+
+    UtSAes_Set_DmaStubs();
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Get_DefaultConfig( &config ) );
+    config.XferMode        = SAES_XFER_MODE_DMA;
+    config.DmaOutChannelId = config.DmaInChannelId;
+
+    UtSAes_Expect_InitPoll();
+    Nvic_Set_PeriphIrq_Prio_ExpectAndReturn( NVIC_PERIPH_IRQ_SAES,
+                                             (nvic_IrqPrio_t)config.IrqPriority,
+                                             NVIC_REQUEST_OK );
+    Nvic_Set_PeriphIrq_Active_ExpectAndReturn( NVIC_PERIPH_IRQ_SAES, NVIC_REQUEST_OK );
+    Nvic_Set_PeriphIrq_Inactive_ExpectAndReturn( NVIC_PERIPH_IRQ_SAES, NVIC_REQUEST_OK );
+    Rcc_Set_PeriphInactive_ExpectAndReturn( RCC_PERIPH_SAES, RCC_REQUEST_OK );
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_ERROR, SAes_Init( &config ) );
+    TEST_ASSERT_EQUAL_UINT32( 0u, utSAes_DmaInitCnt );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   SAes_Set_Process() ECB in the DMA mode moves the full blocks by the two channels, the CPU does not touch
+ *          SAES_DINR / SAES_DOUTR.
+ *
+ * \par Expected results
+ * - SAES_REQUEST_OK; the output channel is started before the input channel, both with the block size 32.
+ * - Input channel: source = the input buffer, destination = SAES_DINR; output channel: source = SAES_DOUTR,
+ *   destination = the output buffer.
+ * - DMAINEN / DMAOUTEN are clear when the channels are started and cleared again at the end; SAES_DINR keeps 0.
+ */
+void Ut_SAes_Set_Process_DmaEcbTwoBlocks_MovesBlocksByDma( void )
+{
+#if defined(SAES)
+    sAes_Request_t request;
+
+    UtSAes_Init_Dma();
+    UtSAes_Set_DmaRequest( &request,
+                           SAES_MODE_ECB,
+                           (const sAes_Data_t *)utSAes_DmaIn,
+                           (sAes_Data_t *)utSAes_DmaOut,
+                           UT_SAES_TWO_BLOCKS_LEN );
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Set_Process( &request ) );
+
+    TEST_ASSERT_EQUAL_UINT32( UT_SAES_DMA_CHANNEL_CNT, utSAes_DmaStartCnt );
+    TEST_ASSERT_EQUAL( UT_SAES_DMA_OUT_CH, utSAes_DmaStartLog[ 0u ] );
+    TEST_ASSERT_EQUAL( UT_SAES_DMA_IN_CH, utSAes_DmaStartLog[ 1u ] );
+    TEST_ASSERT_EQUAL_UINT32( UT_SAES_TWO_BLOCKS_LEN, utSAes_DmaSizeLog[ 0u ].Value );
+    TEST_ASSERT_EQUAL_UINT32( UT_SAES_TWO_BLOCKS_LEN, utSAes_DmaSizeLog[ 1u ].Value );
+    TEST_ASSERT_EQUAL_HEX32( (uint32_t)(uintptr_t)&SAES->DOUTR, utSAes_DmaSrcLog[ 0u ].Value );
+    TEST_ASSERT_EQUAL_HEX32( (uint32_t)(uintptr_t)utSAes_DmaOut, utSAes_DmaDstLog[ 0u ].Value );
+    TEST_ASSERT_EQUAL_HEX32( (uint32_t)(uintptr_t)utSAes_DmaIn, utSAes_DmaSrcLog[ 1u ].Value );
+    TEST_ASSERT_EQUAL_HEX32( (uint32_t)(uintptr_t)&SAES->DINR, utSAes_DmaDstLog[ 1u ].Value );
+    TEST_ASSERT_EQUAL_HEX32( 0u, utSAes_DmaCrAtStart );
+    TEST_ASSERT_EQUAL_HEX32( 0u, ( SAES->CR & UT_SAES_CR_DMA_MASK ) );
+    TEST_ASSERT_EQUAL_HEX32( 0u, SAES->DINR );
+    TEST_ASSERT_EQUAL_UINT32( 0u, utSAes_DmaStopCnt );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   SAes_Set_Process() CTR in the DMA mode moves the full block by the DMA and the partial last block by the
+ *          CPU.
+ *
+ * \par Expected results
+ * - SAES_REQUEST_OK, the block size of the channels is 16 (not 20), the 4 bytes of the last block are read by the
+ *   CPU from SAES_DOUTR (the preset pattern, MSB first).
+ */
+void Ut_SAes_Set_Process_DmaCtrPartialBlock_TailByCpu( void )
+{
+#if defined(SAES)
+    static const sAes_Data_t ctrIv[ SAES_BLOCK_BYTES ] = { UT_SAES_CTR_IV_BYTES };
+    sAes_Request_t           request;
+    const sAes_Data_t *      outBytes = (const sAes_Data_t *)utSAes_DmaOut;
+
+    UtSAes_Init_Dma();
+    SAES->DOUTR = UT_SAES_DOUTR_PATTERN;
+    UtSAes_Set_DmaRequest( &request,
+                           SAES_MODE_CTR,
+                           (const sAes_Data_t *)utSAes_DmaIn,
+                           (sAes_Data_t *)utSAes_DmaOut,
+                           UT_SAES_TAIL_LEN );
+    request.Iv = ctrIv;
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Set_Process( &request ) );
+
+    TEST_ASSERT_EQUAL_UINT32( SAES_BLOCK_BYTES, utSAes_DmaSizeLog[ 0u ].Value );
+    TEST_ASSERT_EQUAL_UINT32( SAES_BLOCK_BYTES, utSAes_DmaSizeLog[ 1u ].Value );
+    TEST_ASSERT_EQUAL_HEX8( UT_SAES_DOUTR_BYTE0, outBytes[ SAES_BLOCK_BYTES ] );
+    TEST_ASSERT_EQUAL_HEX8( UT_SAES_DOUTR_BYTE3, outBytes[ UT_SAES_TAIL_LEN - 1u ] );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   SAes_Set_Process() in the DMA mode splits a long payload in chunks of 65520 bytes (16-bit Gpdma block
+ *          size, a multiple of the block size).
+ *
+ * \par Expected results
+ * - SAES_REQUEST_OK, two chunks: 65520 bytes and 16 bytes, the second one 65520 bytes further in both buffers.
+ */
+void Ut_SAes_Set_Process_DmaLongPayload_SplitsInChunks( void )
+{
+#if defined(SAES)
+    sAes_Request_t request;
+
+    UtSAes_Init_Dma();
+    UtSAes_Set_DmaRequest( &request,
+                           SAES_MODE_ECB,
+                           (const sAes_Data_t *)utSAes_DmaIn,
+                           (sAes_Data_t *)utSAes_DmaOut,
+                           UT_SAES_DMA_BIG_LEN );
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Set_Process( &request ) );
+
+    TEST_ASSERT_EQUAL_UINT32( UT_SAES_DMA_TWO_CHUNK_STARTS, utSAes_DmaStartCnt );
+    TEST_ASSERT_EQUAL_UINT32( UT_SAES_DMA_CHUNK_MAX, utSAes_DmaSizeLog[ UT_SAES_DMA_LOG_CHUNK1_IN ].Value );
+    TEST_ASSERT_EQUAL_UINT32( SAES_BLOCK_BYTES, utSAes_DmaSizeLog[ UT_SAES_DMA_LOG_CHUNK2_IN ].Value );
+    TEST_ASSERT_EQUAL_HEX32( (uint32_t)(uintptr_t)utSAes_DmaIn + UT_SAES_DMA_CHUNK_MAX,
+                             utSAes_DmaSrcLog[ UT_SAES_DMA_LOG_CHUNK2_IN ].Value );
+    TEST_ASSERT_EQUAL_HEX32( (uint32_t)(uintptr_t)utSAes_DmaOut + UT_SAES_DMA_CHUNK_MAX,
+                             utSAes_DmaDstLog[ UT_SAES_DMA_LOG_CHUNK2_OUT ].Value );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   SAes_Set_Process() GCM in the DMA mode moves the header by the input channel only (no output in the header
+ *          phase).
+ *
+ * \par Expected results
+ * - SAES_REQUEST_OK, one channel started: the input channel with the 32 bytes of AAD; no output channel.
+ */
+void Ut_SAes_Set_Process_DmaGcmHeader_InputChannelOnly( void )
+{
+#if defined(SAES)
+    static const sAes_Data_t gcmIv[ SAES_BLOCK_BYTES ] = { UT_SAES_CTR_IV_BYTES };
+    sAes_Data_t              tag[ SAES_BLOCK_BYTES ];
+    sAes_Request_t           request;
+
+    UtSAes_Init_Dma();
+    UtSAes_Set_DmaRequest( &request,
+                           SAES_MODE_GCM,
+                           (const sAes_Data_t *)utSAes_DmaIn,
+                           (sAes_Data_t *)utSAes_DmaOut,
+                           0u );
+    request.Iv     = gcmIv;
+    request.Aad    = (const sAes_Data_t *)utSAes_DmaIn;
+    request.AadLen = UT_SAES_TWO_BLOCKS_LEN;
+    request.Tag    = tag;
+    request.TagLen = SAES_BLOCK_BYTES;
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Set_Process( &request ) );
+
+    TEST_ASSERT_EQUAL_UINT32( 1u, utSAes_DmaStartCnt );
+    TEST_ASSERT_EQUAL( UT_SAES_DMA_IN_CH, utSAes_DmaStartLog[ 0u ] );
+    TEST_ASSERT_EQUAL_UINT32( UT_SAES_TWO_BLOCKS_LEN, utSAes_DmaSizeLog[ 0u ].Value );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   SAes_Set_Process() in the DMA mode rejects a buffer of a full block which is not word aligned before a
+ *          register is touched.
+ *
+ * \par Expected results
+ * - SAES_REQUEST_ERROR, no Gpdma channel started, SAES_CR keeps its value.
+ */
+void Ut_SAes_Set_Process_DmaUnalignedInput_ReturnsErrorWithoutAccess( void )
+{
+#if defined(SAES)
+    sAes_Request_t request;
+    uint32_t       crBefore = 0u;
+
+    UtSAes_Init_Dma();
+    UtSAes_Set_DmaRequest( &request,
+                           SAES_MODE_ECB,
+                           &( (const sAes_Data_t *)utSAes_DmaIn )[ UT_SAES_UNALIGNED_OFFSET ],
+                           (sAes_Data_t *)utSAes_DmaOut,
+                           SAES_BLOCK_BYTES );
+    crBefore = SAES->CR;
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_ERROR, SAes_Set_Process( &request ) );
+    TEST_ASSERT_EQUAL_UINT32( 0u, utSAes_DmaStartCnt );
+    TEST_ASSERT_EQUAL_HEX32( crBefore, SAES->CR );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   SAes_Set_Process() in the DMA mode fails on a Gpdma error and stops both channels.
+ *
+ * \par Expected results
+ * - SAES_REQUEST_ERROR, Gpdma_Set_ChannelInactive called for the input and the output channel, DMAINEN / DMAOUTEN
+ *   cleared.
+ */
+void Ut_SAes_Set_Process_DmaChannelError_ReturnsErrorAndStopsChannels( void )
+{
+#if defined(SAES)
+    sAes_Request_t request;
+
+    UtSAes_Init_Dma();
+    utSAes_DmaFail = SAES_FUNCTION_ACTIVE;
+    UtSAes_Set_DmaRequest( &request,
+                           SAES_MODE_ECB,
+                           (const sAes_Data_t *)utSAes_DmaIn,
+                           (sAes_Data_t *)utSAes_DmaOut,
+                           SAES_BLOCK_BYTES );
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_ERROR, SAes_Set_Process( &request ) );
+    TEST_ASSERT_EQUAL_UINT32( UT_SAES_DMA_CHANNEL_CNT, utSAes_DmaStopCnt );
+    TEST_ASSERT_EQUAL( UT_SAES_DMA_IN_CH, utSAes_DmaStopLog[ 0u ] );
+    TEST_ASSERT_EQUAL( UT_SAES_DMA_OUT_CH, utSAes_DmaStopLog[ 1u ] );
+    TEST_ASSERT_EQUAL_HEX32( 0u, ( SAES->CR & UT_SAES_CR_DMA_MASK ) );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+
+/**
+ * \brief   SAes_Deinit() after the DMA mode releases both Gpdma channels and their interrupts.
+ *
+ * \par Expected results
+ * - SAES_REQUEST_OK, Gpdma_Set_InterruptInactive and Gpdma_Deinit called for channels 2 and 3.
+ */
+void Ut_SAes_Deinit_DmaMode_ReleasesBothChannels( void )
+{
+#if defined(SAES)
+    UtSAes_Init_Dma();
+
+    Gpdma_Set_InterruptInactive_ExpectAndReturn( GPDMA_PERIPH_1, UT_SAES_DMA_IN_CH, GPDMA_REQUEST_OK );
+    Gpdma_Set_InterruptInactive_ExpectAndReturn( GPDMA_PERIPH_1, UT_SAES_DMA_OUT_CH, GPDMA_REQUEST_OK );
+    Gpdma_Deinit_ExpectAndReturn( GPDMA_PERIPH_1, UT_SAES_DMA_IN_CH, GPDMA_REQUEST_OK );
+    Gpdma_Deinit_ExpectAndReturn( GPDMA_PERIPH_1, UT_SAES_DMA_OUT_CH, GPDMA_REQUEST_OK );
+    Nvic_Set_PeriphIrq_Inactive_ExpectAndReturn( NVIC_PERIPH_IRQ_SAES, NVIC_REQUEST_OK );
+    Rcc_Set_PeriphInactive_ExpectAndReturn( RCC_PERIPH_SAES, RCC_REQUEST_OK );
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Deinit() );
+#else
+    TEST_IGNORE_MESSAGE( "MCU without SAES" );
+#endif /* SAES */
+}
+
+/**
  * \brief   SAes_Set_Process() rejects an ECB DataLen that is not a multiple of 16 bytes
  *          before any register is touched.
  *
@@ -1109,6 +1683,276 @@ static void UtSAes_Init_Poll( void )
     UtSAes_Expect_InitPoll();
     TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Get_DefaultConfig( &config ) );
     TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Init( &config ) );
+}
+
+
+
+/**
+ * \brief Fills an AEAD request of the NPBLB tests: inline 128-bit key, the CTR IV bytes as the IV / B0 block, no AAD,
+ *        a payload of \ref UT_SAES_PARTIAL_LEN bytes and a 16-byte tag.
+ *
+ * \param request   [out]: Request to fill
+ * \param operation [in]:  Encrypt or decrypt
+ * \param mode      [in]:  GCM or CCM
+ * \param input     [in]:  Payload input
+ * \param output    [out]: Payload output
+ * \param tag       [out]: Tag buffer
+ */
+static void UtSAes_Set_AeadRequest( sAes_Request_t * const request,
+                                    sAes_Operation_t       operation,
+                                    sAes_Mode_t            mode,
+                                    const sAes_Data_t *    input,
+                                    sAes_Data_t *          output,
+                                    sAes_Data_t *          tag )
+{
+    static const sAes_Data_t iv[ SAES_BLOCK_BYTES ] = { UT_SAES_CTR_IV_BYTES };
+
+    request->Operation = operation;
+    request->Mode      = mode;
+    request->KeySelect = SAES_REQUEST_KEY_INLINE;
+    request->Key       = utSAes_Fips197_Key128;
+    request->KeySize   = SAES_KEY_SIZE_128;
+    request->Iv        = iv;
+    request->Aad       = SAES_NULL_PTR;
+    request->AadLen    = 0u;
+    request->Input     = input;
+    request->Output    = output;
+    request->DataLen   = UT_SAES_PARTIAL_LEN;
+    request->Tag       = tag;
+    request->TagLen    = SAES_BLOCK_BYTES;
+}
+
+
+
+/**
+ * \brief Registers the Gpdma stubs of the DMA tests and clears their logs.
+ */
+static void UtSAes_Set_DmaStubs( void )
+{
+    utSAes_DmaInitCnt   = 0u;
+    utSAes_DmaSizeCnt   = 0u;
+    utSAes_DmaSrcCnt    = 0u;
+    utSAes_DmaDstCnt    = 0u;
+    utSAes_DmaStartCnt  = 0u;
+    utSAes_DmaStopCnt   = 0u;
+    utSAes_DmaFail      = SAES_FUNCTION_INACTIVE;
+    utSAes_DmaCrAtStart = 0u;
+    utSAes_DmaInIsr     = SAES_NULL_PTR;
+    utSAes_DmaOutIsr    = SAES_NULL_PTR;
+    utSAes_DmaErrIsr    = SAES_NULL_PTR;
+
+    Gpdma_Get_DefaultConfig_StubWithCallback( UtSAes_GpdmaDefaultStub );
+    Gpdma_Init_StubWithCallback( UtSAes_GpdmaInitStub );
+    Gpdma_Set_BlockSize_StubWithCallback( UtSAes_GpdmaSizeStub );
+    Gpdma_Set_SourceAddr_StubWithCallback( UtSAes_GpdmaSrcStub );
+    Gpdma_Set_DestinationAddr_StubWithCallback( UtSAes_GpdmaDstStub );
+    Gpdma_Set_ChannelActive_StubWithCallback( UtSAes_GpdmaStartStub );
+    Gpdma_Set_ChannelInactive_StubWithCallback( UtSAes_GpdmaStopStub );
+}
+
+
+/**
+ * \brief Runs a successful \ref SAes_Init in the DMA mode with the default channels (stubs registered, interrupts of
+ *        both channels expected).
+ */
+static void UtSAes_Init_Dma( void )
+{
+    sAes_Config_t config;
+
+    UtSAes_Set_DmaStubs();
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Get_DefaultConfig( &config ) );
+    config.XferMode = SAES_XFER_MODE_DMA;
+
+    UtSAes_Expect_InitPoll();
+    Nvic_Set_PeriphIrq_Prio_ExpectAndReturn( NVIC_PERIPH_IRQ_SAES,
+                                             (nvic_IrqPrio_t)config.IrqPriority,
+                                             NVIC_REQUEST_OK );
+    Nvic_Set_PeriphIrq_Active_ExpectAndReturn( NVIC_PERIPH_IRQ_SAES, NVIC_REQUEST_OK );
+    Gpdma_Set_InterruptActive_ExpectAndReturn( GPDMA_PERIPH_1, UT_SAES_DMA_IN_CH, GPDMA_REQUEST_OK );
+    Gpdma_Set_InterruptActive_ExpectAndReturn( GPDMA_PERIPH_1, UT_SAES_DMA_OUT_CH, GPDMA_REQUEST_OK );
+
+    TEST_ASSERT_EQUAL( SAES_REQUEST_OK, SAes_Init( &config ) );
+}
+
+
+/**
+ * \brief Fills an encryption request of the DMA tests (inline 128-bit key, no IV, no AAD, no tag).
+ *
+ * \param request [out]: Request to fill
+ * \param mode    [in]:  Chaining mode
+ * \param input   [in]:  Input buffer
+ * \param output  [out]: Output buffer
+ * \param dataLen [in]:  Byte length of the payload
+ */
+static void UtSAes_Set_DmaRequest( sAes_Request_t * const request,
+                                   sAes_Mode_t            mode,
+                                   const sAes_Data_t *    input,
+                                   sAes_Data_t *          output,
+                                   sAes_DataLen_t         dataLen )
+{
+    request->Operation = SAES_OPERATION_ENCRYPT;
+    request->Mode      = mode;
+    request->KeySelect = SAES_REQUEST_KEY_INLINE;
+    request->Key       = utSAes_Fips197_Key128;
+    request->KeySize   = SAES_KEY_SIZE_128;
+    request->Iv        = SAES_NULL_PTR;
+    request->Aad       = SAES_NULL_PTR;
+    request->AadLen    = 0u;
+    request->Input     = input;
+    request->Output    = output;
+    request->DataLen   = dataLen;
+    request->Tag       = SAES_NULL_PTR;
+    request->TagLen    = 0u;
+}
+
+
+/** \brief Stub of Gpdma_Get_DefaultConfig: the structure keeps the zeros of the caller */
+static gpdma_RequestState_t UtSAes_GpdmaDefaultStub( gpdma_ConfigStruct_t * configStruct, int callCnt )
+{
+    (void)callCnt;
+    TEST_ASSERT_NOT_NULL( configStruct );
+
+    return ( GPDMA_REQUEST_OK );
+}
+
+
+/** \brief Stub of Gpdma_Init: captures the channel configuration and the interrupts of the module */
+static gpdma_RequestState_t UtSAes_GpdmaInitStub( gpdma_ConfigStruct_t * configStruct, int callCnt )
+{
+    (void)callCnt;
+    TEST_ASSERT_NOT_NULL( configStruct );
+    TEST_ASSERT_NOT_NULL( configStruct->TransferConfig );
+    TEST_ASSERT_LESS_THAN_UINT32( UT_SAES_DMA_CHANNEL_CNT, utSAes_DmaInitCnt );
+
+    utSAes_DmaChannelCfg_t * const cfg = &utSAes_DmaCfg[ utSAes_DmaInitCnt ];
+
+    cfg->ChannelId     = configStruct->ChannelId;
+    cfg->Direction     = configStruct->TransferConfig->Direction;
+    cfg->RequestSource = configStruct->TransferConfig->RequestSource;
+    cfg->SrcDataSize   = configStruct->TransferConfig->SourceDataSize;
+    cfg->DstDataSize   = configStruct->TransferConfig->DestinationDataSize;
+    cfg->SrcAddrMode   = configStruct->TransferConfig->SourceAddrMode;
+    cfg->DstAddrMode   = configStruct->TransferConfig->DestinationAddrMode;
+    cfg->DstDataOp     = configStruct->TransferConfig->DestinationDataOp;
+    cfg->SrcAddr       = configStruct->TransferConfig->SourceAddr;
+    cfg->DstAddr       = configStruct->TransferConfig->DestinationAddr;
+
+    if( UT_SAES_DMA_IN_CH == configStruct->ChannelId )
+    {
+        utSAes_DmaInIsr = configStruct->TransferCompleteIsr;
+    }
+    else
+    {
+        utSAes_DmaOutIsr = configStruct->TransferCompleteIsr;
+    }
+
+    utSAes_DmaErrIsr = configStruct->ErrorIsr;
+    utSAes_DmaInitCnt++;
+
+    return ( GPDMA_REQUEST_OK );
+}
+
+
+/** \brief Stub of Gpdma_Set_BlockSize: logs the channel and the block size */
+static gpdma_RequestState_t UtSAes_GpdmaSizeStub( gpdma_PeriphId_t  periphId,
+                                                  gpdma_ChannelId_t channelId,
+                                                  gpdma_BlockSize_t blockSize,
+                                                  int               callCnt )
+{
+    (void)periphId;
+    (void)callCnt;
+    TEST_ASSERT_LESS_THAN_UINT32( UT_SAES_DMA_LOG_MAX, utSAes_DmaSizeCnt );
+    utSAes_DmaSizeLog[ utSAes_DmaSizeCnt ].ChannelId = channelId;
+    utSAes_DmaSizeLog[ utSAes_DmaSizeCnt ].Value     = blockSize;
+    utSAes_DmaSizeCnt++;
+
+    return ( GPDMA_REQUEST_OK );
+}
+
+
+/** \brief Stub of Gpdma_Set_SourceAddr: logs the channel and the address */
+static gpdma_RequestState_t UtSAes_GpdmaSrcStub( gpdma_PeriphId_t  periphId,
+                                                 gpdma_ChannelId_t channelId,
+                                                 gpdma_SrcAddr_t   sourceAddr,
+                                                 int               callCnt )
+{
+    (void)periphId;
+    (void)callCnt;
+    TEST_ASSERT_LESS_THAN_UINT32( UT_SAES_DMA_LOG_MAX, utSAes_DmaSrcCnt );
+    utSAes_DmaSrcLog[ utSAes_DmaSrcCnt ].ChannelId = channelId;
+    utSAes_DmaSrcLog[ utSAes_DmaSrcCnt ].Value     = sourceAddr;
+    utSAes_DmaSrcCnt++;
+
+    return ( GPDMA_REQUEST_OK );
+}
+
+
+/** \brief Stub of Gpdma_Set_DestinationAddr: logs the channel and the address */
+static gpdma_RequestState_t UtSAes_GpdmaDstStub( gpdma_PeriphId_t  periphId,
+                                                 gpdma_ChannelId_t channelId,
+                                                 gpdma_DstAddr_t   destAddr,
+                                                 int               callCnt )
+{
+    (void)periphId;
+    (void)callCnt;
+    TEST_ASSERT_LESS_THAN_UINT32( UT_SAES_DMA_LOG_MAX, utSAes_DmaDstCnt );
+    utSAes_DmaDstLog[ utSAes_DmaDstCnt ].ChannelId = channelId;
+    utSAes_DmaDstLog[ utSAes_DmaDstCnt ].Value     = destAddr;
+    utSAes_DmaDstCnt++;
+
+    return ( GPDMA_REQUEST_OK );
+}
+
+
+/**
+ * \brief Stub of Gpdma_Set_ChannelActive: logs the channel; the start of the input channel ends the chunk - it calls
+ *        the transfer complete interrupts of both channels (or the error interrupt) of the module.
+ */
+static gpdma_RequestState_t UtSAes_GpdmaStartStub( gpdma_PeriphId_t  periphId,
+                                                   gpdma_ChannelId_t channelId,
+                                                   int               callCnt )
+{
+    (void)periphId;
+    (void)callCnt;
+    TEST_ASSERT_LESS_THAN_UINT32( UT_SAES_DMA_LOG_MAX, utSAes_DmaStartCnt );
+    utSAes_DmaStartLog[ utSAes_DmaStartCnt ] = channelId;
+    utSAes_DmaStartCnt++;
+
+    if( UT_SAES_DMA_IN_CH == channelId )
+    {
+        utSAes_DmaCrAtStart = ( SAES->CR & UT_SAES_CR_DMA_MASK );
+
+        if( SAES_FUNCTION_ACTIVE == utSAes_DmaFail )
+        {
+            utSAes_DmaErrIsr( GPDMA_ERROR_TRANSFER );
+        }
+        else
+        {
+            utSAes_DmaInIsr();
+            utSAes_DmaOutIsr();
+        }
+    }
+    else
+    {
+        /* The output channel waits for the requests of the SAES */
+    }
+
+    return ( GPDMA_REQUEST_OK );
+}
+
+
+/** \brief Stub of Gpdma_Set_ChannelInactive: logs the stopped channel */
+static gpdma_RequestState_t UtSAes_GpdmaStopStub( gpdma_PeriphId_t  periphId,
+                                                  gpdma_ChannelId_t channelId,
+                                                  int               callCnt )
+{
+    (void)periphId;
+    (void)callCnt;
+    TEST_ASSERT_LESS_THAN_UINT32( UT_SAES_DMA_LOG_MAX, utSAes_DmaStopCnt );
+    utSAes_DmaStopLog[ utSAes_DmaStopCnt ] = channelId;
+    utSAes_DmaStopCnt++;
+
+    return ( GPDMA_REQUEST_OK );
 }
 
 #endif /* SAES */

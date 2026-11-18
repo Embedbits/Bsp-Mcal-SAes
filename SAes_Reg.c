@@ -561,6 +561,61 @@ void SAes_Reg_Read_Iv( sAes_Data_t * const ivBytes )
 
 
 /**
+ * \brief Enables or disables the DMA requests of the input and of the output phase (SAES_CR.DMAINEN / DMAOUTEN,
+ *        RM0481 38.6: SAES issues single DMA requests per 16-byte block while the bit is set).
+ *
+ * \param inState  [in]: \ref SAES_FUNCTION_ACTIVE sets DMAINEN, otherwise it is cleared
+ * \param outState [in]: \ref SAES_FUNCTION_ACTIVE sets DMAOUTEN, otherwise it is cleared
+ */
+void SAes_Reg_Set_DmaRequests( sAes_FunctionState_t inState, sAes_FunctionState_t outState )
+{
+    uint32_t regValue = 0u;
+
+    if( SAES_FUNCTION_ACTIVE == inState )
+    {
+        regValue |= AES_CR_DMAINEN;
+    }
+    else
+    {
+        /* No DMA request of the input phase */
+    }
+
+    if( SAES_FUNCTION_ACTIVE == outState )
+    {
+        regValue |= AES_CR_DMAOUTEN;
+    }
+    else
+    {
+        /* No DMA request of the output phase */
+    }
+
+    SAes_Set_RegVal( SAES_REG_CR, ( AES_CR_DMAINEN | AES_CR_DMAOUTEN ), regValue );
+}
+
+
+/**
+ * \brief Returns the address of SAES_DINR (destination of the input channel of the DMA mode).
+ *
+ * \return Address of the register
+ */
+uint32_t SAes_Reg_Get_DinAddr( void )
+{
+    return ( (uint32_t)(uintptr_t)sAes_RegList[ SAES_REG_DINR ].RegAddr );
+}
+
+
+/**
+ * \brief Returns the address of SAES_DOUTR (source of the output channel of the DMA mode).
+ *
+ * \return Address of the register
+ */
+uint32_t SAes_Reg_Get_DoutAddr( void )
+{
+    return ( (uint32_t)(uintptr_t)sAes_RegList[ SAES_REG_DOUTR ].RegAddr );
+}
+
+
+/**
  * \brief Writes one 16-byte data block into SAES_DINR, MSB first (RM0481, 38.8.3).
  *
  * \param inBytes [in]: 16-byte big-endian input block

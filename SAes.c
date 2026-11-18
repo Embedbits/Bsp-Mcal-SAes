@@ -26,10 +26,20 @@
  * completion to \ref SAes_Task / the interrupt. The configured
  * \ref sAes_CompleteCallback_t / \ref sAes_ErrorCallback_t are still invoked at
  * the end of every call, so application code written against the asynchronous
- * contract keeps working; the DMA transfer mode is accepted by \ref SAes_Init
- * (the register side, `AES_CR_DMAINEN` / `AES_CR_DMAOUTEN`, is wired) but the
- * Gpdma channel itself is not started by this implementation - see the README
- * "Implementation status (STM32H5)" for this and the other deviations.
+ * contract keeps working.
+ *
+ * # DMA transfer mode #
+ * With \ref SAES_XFER_MODE_DMA, \ref SAes_Init initializes two Gpdma channels of \ref sAes_Config_t: the input
+ * channel (memory -> SAES_DINR, request SAES_IN) and the output channel (SAES_DOUTR -> memory, request SAES_OUT),
+ * 32-bit words with the bytes of every word exchanged by the Gpdma (the module keeps its big-endian byte order,
+ * SAES_CR.DATATYPE stays "no swapping"). The full 16-byte blocks of the payload (ECB, CBC, CTR, GCM, CCM) and of
+ * the header (GCM, GMAC, CCM: input channel only) are moved by the DMA in chunks of at most
+ * \ref SAES_DMA_CHUNK_MAX bytes (RM0481 38.4.5 "Appending data using DMA", 38.6): the channels are started, then
+ * SAES_CR.DMAINEN / DMAOUTEN are set, the call waits (bounded) for the transfer complete interrupt of the channel
+ * which ends the chunk. The partial last block is a CPU step (zero padding, SAES_CR.NPBLB), as RM0481 requires
+ * for the GCM payload encryption and the CCM payload decryption. The buffers of a request with a full block must
+ * be 32-bit aligned (\ref SAES_REQUEST_ERROR otherwise, before a register is touched); the suspend / resume of
+ * RM0481 is not available in the DMA mode (the call returns only at the end of the data).
  *
  * # CCM scope #
  * The CCM chaining mode drives `SAES_CR.GCMPH` exactly as RM0481 section 38.4.13
@@ -48,6 +58,7 @@
 #include "Nvic_Port.h"                       /* NVIC handler functionality     */
 #include "Rcc_Port.h"                        /* RCC handler functionality      */
 #include "Rng_Port.h"                        /* RNG handler functionality      */
+#include "Gpdma_Port.h"                      /* DMA mode channels              */
 #include "Stm32.h"                           /* SAES registers definition      */
 /* ============================== TYPEDEFS ================================== */
 
@@ -91,6 +102,13 @@ typedef struct
     sAes_Operation_t        CurOperation;     /**< Incremental request: operation                */
     sAes_Mode_t             CurMode;          /**< Incremental request: chaining mode            */
     sAes_FunctionState_t    AadClosed;        /**< Incremental AEAD request: header phase closed */
+    gpdma_PeriphId_t        DmaPeriphId;      /**< Gpdma controller of the DMA mode              */
+    gpdma_ChannelId_t       DmaInChannelId;   /**< Gpdma channel memory -> SAES_DINR             */
+    gpdma_ChannelId_t       DmaOutChannelId;  /**< Gpdma channel SAES_DOUTR -> memory            */
+    sAes_FunctionState_t    DmaInit;          /**< Both Gpdma channels are initialized           */
+    volatile sAes_FunctionState_t DmaInDone;  /**< Transfer complete of the input channel        */
+    volatile sAes_FunctionState_t DmaOutDone; /**< Transfer complete of the output channel       */
+    volatile sAes_FunctionState_t DmaError;   /**< Gpdma error of one of the channels            */
 }   sAes_RuntimeData_t;
 
 /* ======================== FORWARD DECLARATIONS ============================ */
@@ -115,15 +133,17 @@ static sAes_RequestState_t SAes_Exec_LoadKey        ( sAes_KeySource_t keySource
                                                       sAes_FunctionState_t keyProt );
 static void                 SAes_Build_CrBase        ( sAes_Mode_t mode, uint32_t * const chmodRaw );
 static sAes_RequestState_t SAes_Exec_PrepareDecrypt ( void );
-static sAes_RequestState_t SAes_Exec_SimpleBlocks   ( sAes_Operation_t operation,
-                                                      const sAes_Data_t * const input,
-                                                      sAes_Data_t * const output,
-                                                      sAes_DataLen_t dataLen );
+static sAes_RequestState_t SAes_Exec_SimpleBlocks   ( sAes_Operation_t     operation,
+                                                      const sAes_Data_t *  const input,
+                                                      sAes_Data_t *        const output,
+                                                      sAes_DataLen_t       dataLen,
+                                                      sAes_FunctionState_t npblbUsed );
 static sAes_RequestState_t SAes_Exec_AeadHeader     ( const sAes_Data_t * const aad, sAes_DataLen_t aadLen );
-static sAes_RequestState_t SAes_Exec_AeadPayload    ( sAes_Operation_t operation,
+static sAes_RequestState_t SAes_Exec_AeadPayload    ( sAes_Mode_t         mode,
+                                                      sAes_Operation_t    operation,
                                                       const sAes_Data_t * const input,
-                                                      sAes_Data_t * const output,
-                                                      sAes_DataLen_t dataLen );
+                                                      sAes_Data_t *       const output,
+                                                      sAes_DataLen_t      dataLen );
 static sAes_RequestState_t SAes_Exec_GcmFinal       ( sAes_Operation_t operation,
                                                       sAes_DataLen_t aadLen,
                                                       sAes_DataLen_t dataLen,
@@ -135,11 +155,57 @@ static sAes_RequestState_t SAes_Exec_Process_Gcm    ( const sAes_Request_t * con
 static sAes_RequestState_t SAes_Exec_Process_Ccm    ( const sAes_Request_t * const request );
 static sAes_RequestState_t SAes_Check_Request       ( const sAes_Request_t * const request );
 static void                 SAes_Write_Uint64BigEndian( sAes_Data_t * const dest, uint64_t value );
+static sAes_RequestState_t  SAes_Check_DmaBuffers   ( const sAes_Data_t * const input,
+                                                      const sAes_Data_t * const output,
+                                                      sAes_DataLen_t      dataLen,
+                                                      const sAes_Data_t * const aad,
+                                                      sAes_DataLen_t      aadLen );
+static sAes_RequestState_t  SAes_Init_Dma           ( const sAes_Config_t * const sAesConfig );
+static gpdma_RequestState_t SAes_Init_DmaChannel    ( const sAes_Config_t * const sAesConfig,
+                                                      sAes_FunctionState_t       inputChannel );
+static void                 SAes_Deinit_Dma         ( void );
+static sAes_RequestState_t  SAes_Exec_DmaBlocks     ( const sAes_Data_t * const input,
+                                                      sAes_Data_t *       const output,
+                                                      sAes_DataLen_t      byteCnt );
+static sAes_RequestState_t  SAes_Exec_DmaChunk      ( const sAes_Data_t * const input,
+                                                      sAes_Data_t *       const output,
+                                                      sAes_DataLen_t      byteOff,
+                                                      sAes_DataLen_t      chunkSize );
+static gpdma_RequestState_t SAes_Start_DmaChannel   ( gpdma_ChannelId_t channelId,
+                                                      uint32_t          srcAddr,
+                                                      uint32_t          dstAddr,
+                                                      sAes_DataLen_t    chunkSize );
+static sAes_RequestState_t  SAes_Wait_Dma           ( sAes_FunctionState_t outUsed, sAes_DataLen_t chunkSize );
+static void                 SAes_DmaInCompleteIsr   ( void );
+static void                 SAes_DmaOutCompleteIsr  ( void );
+static void                 SAes_DmaErrorIsr        ( gpdma_ErrorMaskId_t errMask );
 
 /* ========================== SYMBOLIC CONSTANTS ============================ */
 
 /** \brief Default interrupt priority proposed by \ref SAes_Get_DefaultConfig */
 #define SAES_DEFAULT_IRQ_PRIO                ( 7u )
+
+/** \brief Default Gpdma channels and priority of the DMA mode proposed by \ref SAes_Get_DefaultConfig (channel 0 is
+ *         the default of the Hash module) */
+#define SAES_DEFAULT_DMA_IN_CHANNEL          ( GPDMA_CHANNEL_2 )
+#define SAES_DEFAULT_DMA_OUT_CHANNEL         ( GPDMA_CHANNEL_3 )
+#define SAES_DEFAULT_DMA_PRIO                ( GPDMA_PRIORITY_LOW )
+
+/** \brief Largest DMA chunk: the biggest multiple of the block size within the 16-bit Gpdma block size */
+#define SAES_DMA_CHUNK_MAX                   ( 65520u )
+
+/** \brief Mask of the address bits that must be zero for a 32-bit DMA access */
+#define SAES_WORD_ALIGN_MASK                 ( 3u )
+
+/** \brief Bounded wait for the end of a DMA chunk: iterations per 16-byte block (RM0481 SAES processing latency:
+ *         at most a few hundred SAES clock cycles per block, large margin) */
+#define SAES_DMA_WAIT_PER_BLOCK_RAW          ( 0x4000u )
+
+/** \brief Gpdma errors reported by the DMA mode */
+#define SAES_DMA_ERROR_MASK                  ( GPDMA_ERROR_TRANSFER      | \
+                                               GPDMA_ERROR_CONFIG_UPDATE | \
+                                               GPDMA_ERROR_CONFIG_ERROR  | \
+                                               GPDMA_ERROR_TRIG_OVERRUN )
 
 /** \brief Byte length of the GCM "last block" length field (RM0481, Table 374: 2 x 64-bit) */
 #define SAES_GCM_FINAL_BLOCK_BYTES           ( 16u )
@@ -147,9 +213,10 @@ static void                 SAes_Write_Uint64BigEndian( sAes_Data_t * const dest
 /** \brief Byte width of a 64-bit GCM length field (RM0481, Table 374) */
 #define SAES_UINT64_BYTES                    ( 8u )
 
-/** \brief Mask of every SAES_CR field set together by \ref SAes_Build_StdCrValue */
+/** \brief Mask of every SAES_CR field set together by \ref SAes_Build_StdCrValue; NPBLB is cleared with them (it is
+ *         set only before the partial last block of a GCM payload encryption / CCM payload decryption) */
 #define SAES_CR_STD_MASK                      ( AES_CR_CHMOD | AES_CR_MODE | AES_CR_KMOD | AES_CR_DATATYPE | \
-                                                 AES_CR_KEYSIZE | AES_CR_GCMPH                                  )
+                                                 AES_CR_KEYSIZE | AES_CR_GCMPH | AES_CR_NPBLB                   )
 
 /* =============================== MACROS =================================== */
 
@@ -169,8 +236,19 @@ static sAes_RuntimeData_t sAes_Runtime =
     .LastXferError    = SAES_XFER_ERROR_NONE,
     .CurOperation     = SAES_OPERATION_ENCRYPT,
     .CurMode          = SAES_MODE_ECB,
-    .AadClosed        = SAES_FUNCTION_INACTIVE
+    .AadClosed        = SAES_FUNCTION_INACTIVE,
+    .DmaPeriphId      = GPDMA_PERIPH_1,
+    .DmaInChannelId   = SAES_DEFAULT_DMA_IN_CHANNEL,
+    .DmaOutChannelId  = SAES_DEFAULT_DMA_OUT_CHANNEL,
+    .DmaInit          = SAES_FUNCTION_INACTIVE,
+    .DmaInDone        = SAES_FUNCTION_INACTIVE,
+    .DmaOutDone       = SAES_FUNCTION_INACTIVE,
+    .DmaError         = SAES_FUNCTION_INACTIVE
 };
+
+/** \brief Transfer lists of the Gpdma channels of the DMA mode (used by the Gpdma module) */
+static volatile gpdma_XferList_t sAes_DmaInXferList[ 1 ];
+static volatile gpdma_XferList_t sAes_DmaOutXferList[ 1 ];
 
 #endif /* SAES */
 
@@ -179,8 +257,8 @@ static sAes_RuntimeData_t sAes_Runtime =
 /**
  * \brief Initializes the module: enables the clock, makes sure the RNG the SAES
  *        side-channel countermeasures depend on is running (RM0481, 38.4.19: SAES
- *        fetches random numbers from the RNG bus) and (ISR/DMA mode) configures
- *        the SAES NVIC interrupt.
+ *        fetches random numbers from the RNG bus), (ISR/DMA mode) configures
+ *        the SAES NVIC interrupt and (DMA mode) initializes the input and the output Gpdma channel.
  *
  * Verifies the result at the end (SAES_CR.EN read-back, rule 2.7); on failure the
  * module is deinitialized and an error is returned.
@@ -228,9 +306,24 @@ sAes_RequestState_t SAes_Init( const sAes_Config_t * const sAesConfig )
                     /* POLL mode, the NVIC line of the peripheral is not used */
                 }
 
-                sAes_Runtime.InitState   = SAES_FUNCTION_ACTIVE;
-                sAes_Runtime.ModuleState = SAES_STATE_IDLE;
-                retState                 = SAES_REQUEST_OK;
+                if( SAES_XFER_MODE_DMA == sAesConfig->XferMode )
+                {
+                    retState = SAes_Init_Dma( sAesConfig );
+                }
+                else
+                {
+                    retState = SAES_REQUEST_OK;
+                }
+
+                if( SAES_REQUEST_OK == retState )
+                {
+                    sAes_Runtime.InitState   = SAES_FUNCTION_ACTIVE;
+                    sAes_Runtime.ModuleState = SAES_STATE_IDLE;
+                }
+                else
+                {
+                    /* A Gpdma channel of the DMA mode could not be initialized: the module is deinitialized below */
+                }
             }
             else
             {
@@ -268,8 +361,8 @@ sAes_RequestState_t SAes_Init( const sAes_Config_t * const sAesConfig )
 
 
 /**
- * \brief Deinitializes the module: clears the key, disables the interrupt, the
- *        SAES and its clock. The RNG is left running (other modules may use it).
+ * \brief Deinitializes the module: clears the key, releases the Gpdma channels of the DMA mode, disables the
+ *        interrupt, the SAES and its clock. The RNG is left running (other modules may use it).
  *
  * \return \ref SAES_REQUEST_OK, \ref SAES_REQUEST_ERROR on a device without the SAES peripheral.
  */
@@ -280,6 +373,7 @@ sAes_RequestState_t SAes_Deinit( void )
 #if defined(SAES)
     SAes_Reg_Set_Disable();
     SAes_Reg_Clear_AllFlags();
+    SAes_Deinit_Dma();
     (void)Nvic_Set_PeriphIrq_Inactive( NVIC_PERIPH_IRQ_SAES );
     (void)Rcc_Set_PeriphInactive( RCC_PERIPH_SAES );
 
@@ -312,7 +406,8 @@ void SAes_Task( void )
 
 
 /**
- * \brief Fills \p sAesConfig with the default configuration (POLL mode, no callbacks).
+ * \brief Fills \p sAesConfig with the default configuration (POLL mode, no callbacks; for the DMA mode GPDMA1 with
+ *        the input channel 2 and the output channel 3 at the low priority).
  *
  * \param sAesConfig [out]: Pointer to the configuration structure
  * \return \ref SAES_REQUEST_OK on success, \ref SAES_REQUEST_ERROR for a null pointer
@@ -325,6 +420,10 @@ sAes_RequestState_t SAes_Get_DefaultConfig( sAes_Config_t * const sAesConfig )
     if( SAES_NULL_PTR != sAesConfig )
     {
         sAesConfig->XferMode         = SAES_XFER_MODE_POLL;
+        sAesConfig->DmaPeriphId      = GPDMA_PERIPH_1;
+        sAesConfig->DmaInChannelId   = SAES_DEFAULT_DMA_IN_CHANNEL;
+        sAesConfig->DmaOutChannelId  = SAES_DEFAULT_DMA_OUT_CHANNEL;
+        sAesConfig->DmaChannelPrio   = SAES_DEFAULT_DMA_PRIO;
         sAesConfig->IrqPriority      = (sAes_IrqPrio_t)SAES_DEFAULT_IRQ_PRIO;
         sAesConfig->CompleteCallback = SAES_NULL_PTR;
         sAesConfig->ErrorCallback    = SAES_NULL_PTR;
@@ -1107,7 +1206,16 @@ sAes_RequestState_t SAes_Set_UpdateAad( const sAes_Data_t * const aad, sAes_Data
         ( ( SAES_NULL_PTR != aad )  ||
           ( 0u == aadLen )            )                             )
     {
-        retState = SAes_Exec_AeadHeader( aad, aadLen );
+        retState = SAes_Check_DmaBuffers( SAES_NULL_PTR, SAES_NULL_PTR, 0u, aad, aadLen );
+
+        if( SAES_REQUEST_OK == retState )
+        {
+            retState = SAes_Exec_AeadHeader( aad, aadLen );
+        }
+        else
+        {
+            /* A buffer of the DMA mode is not word aligned, nothing is written */
+        }
     }
     else
     {
@@ -1143,9 +1251,15 @@ sAes_RequestState_t SAes_Set_Update( const sAes_Data_t * const input,
         ( SAES_NULL_PTR != input )                          &&
         ( SAES_NULL_PTR != output )                           )
     {
-        const sAes_FunctionState_t isAead = SAes_Calc_IsAead( sAes_Runtime.CurMode );
+        const sAes_FunctionState_t isAead     = SAes_Calc_IsAead( sAes_Runtime.CurMode );
+        const sAes_RequestState_t  alignState = SAes_Check_DmaBuffers( input, output, dataLen, SAES_NULL_PTR, 0u );
 
-        if( SAES_FUNCTION_ACTIVE == isAead )
+        if( SAES_REQUEST_OK != alignState )
+        {
+            /* A buffer of the DMA mode is not word aligned, nothing is written */
+            retState = SAES_REQUEST_ERROR;
+        }
+        else if( SAES_FUNCTION_ACTIVE == isAead )
         {
             if( SAES_FUNCTION_INACTIVE == sAes_Runtime.AadClosed )
             {
@@ -1156,7 +1270,11 @@ sAes_RequestState_t SAes_Set_Update( const sAes_Data_t * const input,
                 /* Header phase already closed by an earlier SAes_Set_UpdateAad */
             }
 
-            retState = SAes_Exec_AeadPayload( sAes_Runtime.CurOperation, input, output, dataLen );
+            retState = SAes_Exec_AeadPayload( sAes_Runtime.CurMode,
+                                              sAes_Runtime.CurOperation,
+                                              input,
+                                              output,
+                                              dataLen );
         }
         else
         {
@@ -1165,7 +1283,11 @@ sAes_RequestState_t SAes_Set_Update( const sAes_Data_t * const input,
 
             if( SAES_REQUEST_OK == enableState )
             {
-                retState = SAes_Exec_SimpleBlocks( sAes_Runtime.CurOperation, input, output, dataLen );
+                retState = SAes_Exec_SimpleBlocks( sAes_Runtime.CurOperation,
+                                                   input,
+                                                   output,
+                                                   dataLen,
+                                                   SAES_FUNCTION_INACTIVE );
             }
             else
             {
@@ -1829,12 +1951,16 @@ static sAes_RequestState_t SAes_Exec_PrepareDecrypt( void )
  * \param input     [in]:  Input buffer
  * \param output    [out]: Output buffer, same length as \p input
  * \param dataLen   [in]:  Byte length of \p input / \p output
+ * \param npblbUsed [in]:  \ref SAES_FUNCTION_ACTIVE: the count of the padding bytes of a partial last block is
+ *                         written to SAES_CR.NPBLB before the block (GCM payload encryption, CCM payload
+ *                         decryption: the tag is wrong otherwise, RM0481 SAES_CR.NPBLB)
  * \return \ref SAES_REQUEST_OK on success, \ref SAES_REQUEST_ERROR otherwise
  */
-static sAes_RequestState_t SAes_Exec_SimpleBlocks( sAes_Operation_t operation,
-                                                   const sAes_Data_t * const input,
-                                                   sAes_Data_t * const output,
-                                                   sAes_DataLen_t dataLen )
+static sAes_RequestState_t SAes_Exec_SimpleBlocks( sAes_Operation_t     operation,
+                                                   const sAes_Data_t *  const input,
+                                                   sAes_Data_t *        const output,
+                                                   sAes_DataLen_t       dataLen,
+                                                   sAes_FunctionState_t npblbUsed )
 {
     sAes_RequestState_t retState   = SAES_REQUEST_OK;
     sAes_Data_t           blockIn[SAES_BLOCK_BYTES]  = { 0u };
@@ -1844,23 +1970,31 @@ static sAes_RequestState_t SAes_Exec_SimpleBlocks( sAes_Operation_t operation,
 
     (void)operation;
 
-    for( sAes_DataLen_t blockIdx = 0u; fullBlocks > blockIdx; blockIdx++ )
+    if( ( SAES_XFER_MODE_DMA == sAes_Runtime.XferMode ) &&
+        ( 0u                 <  fullBlocks            )    )
     {
-        const sAes_DataLen_t byteOff = ( blockIdx * SAES_BLOCK_BYTES );
-
-        SAes_Reg_Write_Block( &input[byteOff] );
-
-        const sAes_RegWaitResult_t ccfResult = SAes_Reg_Wait_Ccf();
-
-        if( SAES_REG_WAIT_OK == ccfResult )
+        retState = SAes_Exec_DmaBlocks( input, output, ( fullBlocks * SAES_BLOCK_BYTES ) );
+    }
+    else
+    {
+        for( sAes_DataLen_t blockIdx = 0u; fullBlocks > blockIdx; blockIdx++ )
         {
-            SAes_Reg_Read_Block( &output[byteOff] );
-            SAes_Reg_Clear_Ccf();
-        }
-        else
-        {
-            retState = SAES_REQUEST_ERROR;
-            break;
+            const sAes_DataLen_t byteOff = ( blockIdx * SAES_BLOCK_BYTES );
+
+            SAes_Reg_Write_Block( &input[byteOff] );
+
+            const sAes_RegWaitResult_t ccfResult = SAes_Reg_Wait_Ccf();
+
+            if( SAES_REG_WAIT_OK == ccfResult )
+            {
+                SAes_Reg_Read_Block( &output[byteOff] );
+                SAes_Reg_Clear_Ccf();
+            }
+            else
+            {
+                retState = SAES_REQUEST_ERROR;
+                break;
+            }
         }
     }
 
@@ -1879,6 +2013,17 @@ static sAes_RequestState_t SAes_Exec_SimpleBlocks( sAes_Operation_t operation,
             {
                 blockIn[idx] = 0u;
             }
+        }
+
+        if( SAES_FUNCTION_ACTIVE == npblbUsed )
+        {
+            SAes_Set_RegVal( SAES_REG_CR,
+                             AES_CR_NPBLB,
+                             ( (uint32_t)( SAES_BLOCK_BYTES - tailBytes ) << AES_CR_NPBLB_Pos ) );
+        }
+        else
+        {
+            /* The padding bytes do not enter a tag */
         }
 
         SAes_Reg_Write_Block( blockIn );
@@ -1929,20 +2074,29 @@ static sAes_RequestState_t SAes_Exec_AeadHeader( const sAes_Data_t * const aad, 
         SAes_Set_RegVal( SAES_REG_CR, AES_CR_GCMPH, ( SAES_CR_GCMPH_HEADER_RAW << AES_CR_GCMPH_Pos ) );
         (void)SAes_Reg_Set_Enable();
 
-        for( sAes_DataLen_t blockIdx = 0u; fullBlocks > blockIdx; blockIdx++ )
+        if( ( SAES_XFER_MODE_DMA == sAes_Runtime.XferMode ) &&
+            ( 0u                 <  fullBlocks            )    )
         {
-            SAes_Reg_Write_Block( &aad[blockIdx * SAES_BLOCK_BYTES] );
-
-            const sAes_RegWaitResult_t ccfResult = SAes_Reg_Wait_Ccf();
-
-            if( SAES_REG_WAIT_OK == ccfResult )
+            /* The header phase has no output: only the input channel runs (RM0481 38.4.11, DMAINEN) */
+            retState = SAes_Exec_DmaBlocks( aad, SAES_NULL_PTR, ( fullBlocks * SAES_BLOCK_BYTES ) );
+        }
+        else
+        {
+            for( sAes_DataLen_t blockIdx = 0u; fullBlocks > blockIdx; blockIdx++ )
             {
-                SAes_Reg_Clear_Ccf();
-            }
-            else
-            {
-                retState = SAES_REQUEST_ERROR;
-                break;
+                SAes_Reg_Write_Block( &aad[blockIdx * SAES_BLOCK_BYTES] );
+
+                const sAes_RegWaitResult_t ccfResult = SAes_Reg_Wait_Ccf();
+
+                if( SAES_REG_WAIT_OK == ccfResult )
+                {
+                    SAes_Reg_Clear_Ccf();
+                }
+                else
+                {
+                    retState = SAES_REQUEST_ERROR;
+                    break;
+                }
             }
         }
 
@@ -1982,22 +2136,39 @@ static sAes_RequestState_t SAes_Exec_AeadHeader( const sAes_Data_t * const aad, 
 
 
 /**
- * \brief Runs the GCM/CCM payload phase (RM0481, 38.4.11 / 38.4.13 "append payload data").
+ * \brief Runs the GCM/CCM payload phase (RM0481, 38.4.11 / 38.4.13 "append payload data"). The partial last block
+ *        of a GCM encryption or of a CCM decryption needs SAES_CR.NPBLB (RM0481 SAES_CR.NPBLB).
  *
+ * \param mode      [in]:  Chaining mode (GCM, GMAC or CCM)
  * \param operation [in]:  Encrypt or decrypt
  * \param input     [in]:  Plaintext (encrypt) or ciphertext (decrypt)
  * \param output    [out]: Ciphertext (encrypt) or plaintext (decrypt)
  * \param dataLen   [in]:  Byte length of \p input / \p output
  * \return \ref SAES_REQUEST_OK on success, \ref SAES_REQUEST_ERROR otherwise
  */
-static sAes_RequestState_t SAes_Exec_AeadPayload( sAes_Operation_t operation,
+static sAes_RequestState_t SAes_Exec_AeadPayload( sAes_Mode_t         mode,
+                                                  sAes_Operation_t    operation,
                                                   const sAes_Data_t * const input,
-                                                  sAes_Data_t * const output,
-                                                  sAes_DataLen_t dataLen )
+                                                  sAes_Data_t *       const output,
+                                                  sAes_DataLen_t      dataLen )
 {
+    sAes_FunctionState_t npblbUsed = SAES_FUNCTION_INACTIVE;
+
+    if( ( ( SAES_MODE_GCM          == mode      ) &&
+          ( SAES_OPERATION_ENCRYPT == operation )    ) ||
+        ( ( SAES_MODE_CCM          == mode      ) &&
+          ( SAES_OPERATION_DECRYPT == operation )    )    )
+    {
+        npblbUsed = SAES_FUNCTION_ACTIVE;
+    }
+    else
+    {
+        /* GCM decryption, CCM encryption: the tag is computed over the zero-padded input block */
+    }
+
     (void)SAes_Reg_Set_Enable();
 
-    return ( SAes_Exec_SimpleBlocks( operation, input, output, dataLen ) );
+    return ( SAes_Exec_SimpleBlocks( operation, input, output, dataLen, npblbUsed ) );
 }
 
 
@@ -2182,7 +2353,8 @@ static sAes_RequestState_t SAes_Exec_Process_Simple( const sAes_Request_t * cons
                     retState = SAes_Exec_SimpleBlocks( request->Operation,
                                                        request->Input,
                                                        request->Output,
-                                                       request->DataLen );
+                                                       request->DataLen ,
+                                                       SAES_FUNCTION_INACTIVE );
                 }
                 else
                 {
@@ -2232,7 +2404,8 @@ static sAes_RequestState_t SAes_Exec_Process_Simple( const sAes_Request_t * cons
                 retState = SAes_Exec_SimpleBlocks( request->Operation,
                                                    request->Input,
                                                    request->Output,
-                                                   request->DataLen );
+                                                   request->DataLen ,
+                                                   SAES_FUNCTION_INACTIVE );
             }
             else
             {
@@ -2300,7 +2473,8 @@ static sAes_RequestState_t SAes_Exec_Process_Gcm( const sAes_Request_t * const r
 
             if( SAES_REQUEST_OK == headerState )
             {
-                const sAes_RequestState_t payloadState = SAes_Exec_AeadPayload( request->Operation,
+                const sAes_RequestState_t payloadState = SAes_Exec_AeadPayload( request->Mode,
+                                                                                request->Operation,
                                                                                 request->Input,
                                                                                 request->Output,
                                                                                 request->DataLen );
@@ -2392,7 +2566,8 @@ static sAes_RequestState_t SAes_Exec_Process_Ccm( const sAes_Request_t * const r
 
             if( SAES_REQUEST_OK == headerState )
             {
-                const sAes_RequestState_t payloadState = SAes_Exec_AeadPayload( request->Operation,
+                const sAes_RequestState_t payloadState = SAes_Exec_AeadPayload( request->Mode,
+                                                                                request->Operation,
                                                                                 request->Input,
                                                                                 request->Output,
                                                                                 request->DataLen );
@@ -2495,7 +2670,11 @@ static sAes_RequestState_t SAes_Check_Request( const sAes_Request_t * const requ
         }
         else
         {
-            retState = SAES_REQUEST_OK;
+            retState = SAes_Check_DmaBuffers( request->Input,
+                                              request->Output,
+                                              request->DataLen,
+                                              request->Aad,
+                                              request->AadLen );
         }
     }
     else
@@ -2505,6 +2684,504 @@ static sAes_RequestState_t SAes_Check_Request( const sAes_Request_t * const requ
     }
 
     return ( retState );
+}
+
+
+/**
+ * \brief Checks the buffers of a request for the DMA mode: the DMA moves 32-bit words, so a buffer which holds a
+ *        full block (moved by the DMA) must be word aligned. Other transfer modes accept every buffer.
+ *
+ * \param input   [in]: Payload input (\ref SAES_NULL_PTR without a payload)
+ * \param output  [in]: Payload output (\ref SAES_NULL_PTR without a payload)
+ * \param dataLen [in]: Byte length of the payload
+ * \param aad     [in]: Additional authenticated data (\ref SAES_NULL_PTR without AAD)
+ * \param aadLen  [in]: Byte length of \p aad
+ * \return \ref SAES_REQUEST_OK when the DMA can move the buffers, \ref SAES_REQUEST_ERROR otherwise
+ */
+static sAes_RequestState_t SAes_Check_DmaBuffers( const sAes_Data_t * const input,
+                                                  const sAes_Data_t * const output,
+                                                  sAes_DataLen_t      dataLen,
+                                                  const sAes_Data_t * const aad,
+                                                  sAes_DataLen_t      aadLen )
+{
+    sAes_RequestState_t retState = SAES_REQUEST_OK;
+
+    if( SAES_XFER_MODE_DMA == sAes_Runtime.XferMode )
+    {
+        const uint32_t dataAlign = ( ( (uint32_t)(uintptr_t)input | (uint32_t)(uintptr_t)output ) &
+                                     SAES_WORD_ALIGN_MASK );
+        const uint32_t aadAlign  = ( (uint32_t)(uintptr_t)aad & SAES_WORD_ALIGN_MASK );
+
+        if( ( ( SAES_BLOCK_BYTES <= dataLen   ) &&
+              ( 0u               != dataAlign )    ) ||
+            ( ( SAES_BLOCK_BYTES <= aadLen    ) &&
+              ( 0u               != aadAlign  )    )    )
+        {
+            /* A full block of a buffer which is not word aligned cannot be moved by the DMA */
+            retState = SAES_REQUEST_ERROR;
+        }
+        else
+        {
+            /* Word aligned buffers, or no full block for the DMA */
+            retState = SAES_REQUEST_OK;
+        }
+    }
+    else
+    {
+        /* POLL / ISR mode: the CPU moves the bytes */
+        retState = SAES_REQUEST_OK;
+    }
+
+    return ( retState );
+}
+
+
+/**
+ * \brief Initializes the input and the output Gpdma channel of the DMA mode and activates their interrupts.
+ *
+ * \param sAesConfig [in]: Configuration of the module (Gpdma controller, channels, priority)
+ * \return \ref SAES_REQUEST_OK when both channels are ready, \ref SAES_REQUEST_ERROR otherwise
+ */
+static sAes_RequestState_t SAes_Init_Dma( const sAes_Config_t * const sAesConfig )
+{
+    sAes_RequestState_t  retState = SAES_REQUEST_ERROR;
+    gpdma_RequestState_t dmaState = GPDMA_REQUEST_ERROR;
+
+    sAes_Runtime.DmaPeriphId     = sAesConfig->DmaPeriphId;
+    sAes_Runtime.DmaInChannelId  = sAesConfig->DmaInChannelId;
+    sAes_Runtime.DmaOutChannelId = sAesConfig->DmaOutChannelId;
+
+    if( sAesConfig->DmaInChannelId != sAesConfig->DmaOutChannelId )
+    {
+        dmaState = SAes_Init_DmaChannel( sAesConfig, SAES_FUNCTION_ACTIVE );
+    }
+    else
+    {
+        /* One channel cannot serve both directions */
+        dmaState = GPDMA_REQUEST_ERROR;
+    }
+
+    if( GPDMA_REQUEST_OK == dmaState )
+    {
+        dmaState = SAes_Init_DmaChannel( sAesConfig, SAES_FUNCTION_INACTIVE );
+    }
+    else
+    {
+        /* The input channel failed */
+    }
+
+    if( GPDMA_REQUEST_OK == dmaState )
+    {
+        sAes_Runtime.DmaInit = SAES_FUNCTION_ACTIVE;
+
+        dmaState = Gpdma_Set_InterruptActive( sAesConfig->DmaPeriphId, sAesConfig->DmaInChannelId );
+    }
+    else
+    {
+        /* The output channel failed */
+    }
+
+    if( GPDMA_REQUEST_OK == dmaState )
+    {
+        dmaState = Gpdma_Set_InterruptActive( sAesConfig->DmaPeriphId, sAesConfig->DmaOutChannelId );
+    }
+    else
+    {
+        /* The interrupt of the input channel failed */
+    }
+
+    if( GPDMA_REQUEST_OK == dmaState )
+    {
+        retState = SAES_REQUEST_OK;
+    }
+    else
+    {
+        retState = SAES_REQUEST_ERROR;
+    }
+
+    return ( retState );
+}
+
+
+/**
+ * \brief Initializes one Gpdma channel of the DMA mode: single requests of the SAES, 32-bit words, the bytes of
+ *        every word exchanged on the destination side (the SAES data registers hold the block MSB first, the
+ *        memory holds it as a byte array). The block size and the memory address are set per chunk.
+ *
+ * \param sAesConfig   [in]: Configuration of the module
+ * \param inputChannel [in]: \ref SAES_FUNCTION_ACTIVE: input channel (memory -> SAES_DINR, request SAES_IN),
+ *                           otherwise the output channel (SAES_DOUTR -> memory, request SAES_OUT)
+ * \return Result of \ref Gpdma_Init
+ */
+static gpdma_RequestState_t SAes_Init_DmaChannel( const sAes_Config_t * const sAesConfig,
+                                                  sAes_FunctionState_t       inputChannel )
+{
+    gpdma_ConfigStruct_t   dmaConfig  = { 0 };
+    gpdma_TransferConfig_t xferConfig = { 0 };
+    gpdma_RequestState_t   dmaState   = Gpdma_Get_DefaultConfig( &dmaConfig );
+
+    xferConfig.XferListExecMode            = GPDMA_XFER_LIST_EXEC_ONCE;
+    xferConfig.EventMode                   = GPDMA_TRANSFER_EVENT_BLOCK;
+    xferConfig.TriggerType                 = GPDMA_TRG_NOT_USED;
+    xferConfig.TriggerSource               = GPDMA_TRG_EXTI_LINE0;
+    xferConfig.TriggerMode                 = GPDMA_TRIGGER_BLOCK;
+    xferConfig.RequestMode                 = GPDMA_PERIPH_REQ_SINGLE;
+    xferConfig.BlockSize                   = 0u; /* Set per chunk by SAes_Start_DmaChannel */
+    xferConfig.BlockRepetitionCount        = 0u;
+    xferConfig.SourceDataSize              = GPDMA_DATA_SIZE_32BITS;
+    xferConfig.SourceBurstLength           = 1u;
+    xferConfig.SourcePortId                = GPDMA_PORT_DEFAULT;
+    xferConfig.SourceDataOp                = GPDMA_SRC_DATA_PRESERVE;
+    xferConfig.SourceBlockOffset2D         = 0u;
+    xferConfig.SourceRepBlockOffset2D      = 0u;
+    xferConfig.DestinationDataSize         = GPDMA_DATA_SIZE_32BITS;
+    xferConfig.DestinationBurstLength      = 1u;
+    xferConfig.DestinationPortId           = GPDMA_PORT_DEFAULT;
+    xferConfig.DestinationDataOp           = GPDMA_DEST_DATA_BYTE_2BYTES_SWAP;
+    xferConfig.DestinationBlockOffset2D    = 0u;
+    xferConfig.DestinationRepBlockOffset2D = 0u;
+
+    dmaConfig.PeriphId           = sAesConfig->DmaPeriphId;
+    dmaConfig.ChannelPrio        = sAesConfig->DmaChannelPrio;
+    dmaConfig.TransferExecMode   = GPDMA_XFER_EXEC_BLOCKING;
+    dmaConfig.TransferConfig     = &xferConfig;
+    dmaConfig.TransfersCount     = 1u;
+    dmaConfig.XferListAccessMode = GPDMA_TRANSFER_LIST_ACCESS_SINGLE;
+    dmaConfig.TransferLockState  = GPDMA_TRANSFER_LIST_LOCKED;
+    dmaConfig.HalfTransferIsr    = SAES_NULL_PTR;
+    dmaConfig.ErrorIsr           = SAes_DmaErrorIsr;
+    dmaConfig.ErrorMask          = SAES_DMA_ERROR_MASK;
+
+    if( SAES_FUNCTION_ACTIVE == inputChannel )
+    {
+        xferConfig.Direction           = GPDMA_DIR_MEMORY_TO_PERIPH;
+        xferConfig.RequestSource       = GPDMA_REQ_SAES_IN;
+        xferConfig.SourceAddr          = 0u; /* Set per chunk by SAes_Start_DmaChannel */
+        xferConfig.SourceAddrMode      = GPDMA_ADDR_INCREMENT;
+        xferConfig.DestinationAddr     = (gpdma_DstAddr_t)SAes_Reg_Get_DinAddr();
+        xferConfig.DestinationAddrMode = GPDMA_ADDR_STATIC;
+        dmaConfig.ChannelId            = sAesConfig->DmaInChannelId;
+        dmaConfig.XferList             = &sAes_DmaInXferList[ 0 ];
+        dmaConfig.TransferCompleteIsr  = SAes_DmaInCompleteIsr;
+    }
+    else
+    {
+        xferConfig.Direction           = GPDMA_DIR_PERIPH_TO_MEMORY;
+        xferConfig.RequestSource       = GPDMA_REQ_SAES_OUT;
+        xferConfig.SourceAddr          = (gpdma_SrcAddr_t)SAes_Reg_Get_DoutAddr();
+        xferConfig.SourceAddrMode      = GPDMA_ADDR_STATIC;
+        xferConfig.DestinationAddr     = 0u; /* Set per chunk by SAes_Start_DmaChannel */
+        xferConfig.DestinationAddrMode = GPDMA_ADDR_INCREMENT;
+        dmaConfig.ChannelId            = sAesConfig->DmaOutChannelId;
+        dmaConfig.XferList             = &sAes_DmaOutXferList[ 0 ];
+        dmaConfig.TransferCompleteIsr  = SAes_DmaOutCompleteIsr;
+    }
+
+    if( GPDMA_REQUEST_OK == dmaState )
+    {
+        dmaState = Gpdma_Init( &dmaConfig );
+    }
+    else
+    {
+        /* The default configuration is not available */
+    }
+
+    return ( dmaState );
+}
+
+
+/**
+ * \brief Releases the Gpdma channels of the DMA mode (\ref Gpdma_Deinit stops a running transfer), if initialized.
+ */
+static void SAes_Deinit_Dma( void )
+{
+    if( SAES_FUNCTION_ACTIVE == sAes_Runtime.DmaInit )
+    {
+        (void)Gpdma_Set_InterruptInactive( sAes_Runtime.DmaPeriphId, sAes_Runtime.DmaInChannelId );
+        (void)Gpdma_Set_InterruptInactive( sAes_Runtime.DmaPeriphId, sAes_Runtime.DmaOutChannelId );
+        (void)Gpdma_Deinit( sAes_Runtime.DmaPeriphId, sAes_Runtime.DmaInChannelId );
+        (void)Gpdma_Deinit( sAes_Runtime.DmaPeriphId, sAes_Runtime.DmaOutChannelId );
+    }
+    else
+    {
+        /* No channel of the DMA mode */
+    }
+
+    sAes_Runtime.DmaInit = SAES_FUNCTION_INACTIVE;
+}
+
+
+/**
+ * \brief Moves \p byteCnt bytes (full blocks) through the SAES by the DMA, in chunks of at most
+ *        \ref SAES_DMA_CHUNK_MAX bytes.
+ *
+ * \param input   [in]:  Word aligned input buffer
+ * \param output  [out]: Word aligned output buffer, \ref SAES_NULL_PTR in the header phase (no output)
+ * \param byteCnt [in]:  Byte count, a multiple of \ref SAES_BLOCK_BYTES
+ * \return \ref SAES_REQUEST_OK when every chunk was moved, \ref SAES_REQUEST_ERROR otherwise
+ */
+static sAes_RequestState_t SAes_Exec_DmaBlocks( const sAes_Data_t * const input,
+                                                sAes_Data_t *       const output,
+                                                sAes_DataLen_t      byteCnt )
+{
+    sAes_RequestState_t retState = SAES_REQUEST_OK;
+
+    for( sAes_DataLen_t byteOff = 0u;
+         ( byteCnt         >  byteOff  ) &&
+         ( SAES_REQUEST_OK == retState )    ;
+         byteOff += SAES_DMA_CHUNK_MAX )
+    {
+        sAes_DataLen_t chunkSize = ( byteCnt - byteOff );
+
+        if( SAES_DMA_CHUNK_MAX < chunkSize )
+        {
+            chunkSize = SAES_DMA_CHUNK_MAX;
+        }
+        else
+        {
+            /* The rest fits one chunk */
+        }
+
+        retState = SAes_Exec_DmaChunk( input, output, byteOff, chunkSize );
+    }
+
+    return ( retState );
+}
+
+
+/**
+ * \brief Moves one chunk by the DMA (RM0481 38.4.5 "Appending data using DMA"): starts the output channel (if any)
+ *        and the input channel, sets SAES_CR.DMAINEN / DMAOUTEN, waits for the end of the chunk and clears the DMA
+ *        requests and SAES_ISR.CCF (back to the software control). On an error both channels are stopped.
+ *
+ * \param input     [in]:  Word aligned input buffer
+ * \param output    [out]: Word aligned output buffer, \ref SAES_NULL_PTR in the header phase
+ * \param byteOff   [in]:  Byte offset of the chunk in the buffers
+ * \param chunkSize [in]:  Byte count of the chunk (multiple of \ref SAES_BLOCK_BYTES, at most
+ *                         \ref SAES_DMA_CHUNK_MAX)
+ * \return \ref SAES_REQUEST_OK when the chunk was moved, \ref SAES_REQUEST_ERROR otherwise
+ */
+static sAes_RequestState_t SAes_Exec_DmaChunk( const sAes_Data_t * const input,
+                                               sAes_Data_t *       const output,
+                                               sAes_DataLen_t      byteOff,
+                                               sAes_DataLen_t      chunkSize )
+{
+    sAes_RequestState_t  retState = SAES_REQUEST_ERROR;
+    gpdma_RequestState_t dmaState = GPDMA_REQUEST_OK;
+    sAes_FunctionState_t outUsed  = SAES_FUNCTION_INACTIVE;
+
+    sAes_Runtime.DmaInDone  = SAES_FUNCTION_INACTIVE;
+    sAes_Runtime.DmaOutDone = SAES_FUNCTION_INACTIVE;
+    sAes_Runtime.DmaError   = SAES_FUNCTION_INACTIVE;
+
+    if( SAES_NULL_PTR != output )
+    {
+        outUsed  = SAES_FUNCTION_ACTIVE;
+        dmaState = SAes_Start_DmaChannel( sAes_Runtime.DmaOutChannelId,
+                                          SAes_Reg_Get_DoutAddr(),
+                                          (uint32_t)(uintptr_t)&output[ byteOff ],
+                                          chunkSize );
+    }
+    else
+    {
+        /* Header phase: the SAES has no output */
+    }
+
+    if( GPDMA_REQUEST_OK == dmaState )
+    {
+        dmaState = SAes_Start_DmaChannel( sAes_Runtime.DmaInChannelId,
+                                          (uint32_t)(uintptr_t)&input[ byteOff ],
+                                          SAes_Reg_Get_DinAddr(),
+                                          chunkSize );
+    }
+    else
+    {
+        /* The output channel could not be started */
+    }
+
+    if( GPDMA_REQUEST_OK == dmaState )
+    {
+        SAes_Reg_Set_DmaRequests( SAES_FUNCTION_ACTIVE, outUsed );
+        retState = SAes_Wait_Dma( outUsed, chunkSize );
+        SAes_Reg_Set_DmaRequests( SAES_FUNCTION_INACTIVE, SAES_FUNCTION_INACTIVE );
+    }
+    else
+    {
+        retState = SAES_REQUEST_ERROR;
+    }
+
+    if( SAES_REQUEST_OK != retState )
+    {
+        (void)Gpdma_Set_ChannelInactive( sAes_Runtime.DmaPeriphId, sAes_Runtime.DmaInChannelId );
+        (void)Gpdma_Set_ChannelInactive( sAes_Runtime.DmaPeriphId, sAes_Runtime.DmaOutChannelId );
+    }
+    else
+    {
+        /* Both channels ended their block */
+    }
+
+    SAes_Reg_Clear_Ccf();
+
+    return ( retState );
+}
+
+
+/**
+ * \brief Sets the block size and the addresses of a Gpdma channel of the DMA mode and starts it. The addresses
+ *        of the register side are written again: a channel stopped after an error was reset.
+ *
+ * \param channelId [in]: Gpdma channel
+ * \param srcAddr   [in]: Source address
+ * \param dstAddr   [in]: Destination address
+ * \param chunkSize [in]: Byte count of the chunk
+ * \return \ref GPDMA_REQUEST_OK when the channel runs, otherwise the first error of the Gpdma module
+ */
+static gpdma_RequestState_t SAes_Start_DmaChannel( gpdma_ChannelId_t channelId,
+                                                   uint32_t          srcAddr,
+                                                   uint32_t          dstAddr,
+                                                   sAes_DataLen_t    chunkSize )
+{
+    gpdma_RequestState_t dmaState = Gpdma_Set_BlockSize( sAes_Runtime.DmaPeriphId,
+                                                         channelId,
+                                                         (gpdma_BlockSize_t)chunkSize );
+
+    if( GPDMA_REQUEST_OK == dmaState )
+    {
+        dmaState = Gpdma_Set_SourceAddr( sAes_Runtime.DmaPeriphId, channelId, (gpdma_SrcAddr_t)srcAddr );
+    }
+    else
+    {
+        /* The block size was not accepted */
+    }
+
+    if( GPDMA_REQUEST_OK == dmaState )
+    {
+        dmaState = Gpdma_Set_DestinationAddr( sAes_Runtime.DmaPeriphId, channelId, (gpdma_DstAddr_t)dstAddr );
+    }
+    else
+    {
+        /* The source address was not accepted */
+    }
+
+    if( GPDMA_REQUEST_OK == dmaState )
+    {
+        dmaState = Gpdma_Set_ChannelActive( sAes_Runtime.DmaPeriphId, channelId );
+    }
+    else
+    {
+        /* The destination address was not accepted */
+    }
+
+    return ( dmaState );
+}
+
+
+/**
+ * \brief Waits (bounded) for the end of a DMA chunk: the transfer complete of the output channel (payload) or of
+ *        the input channel and the end of the processing of the last block (header, SAES_SR.BUSY cleared).
+ *
+ * \param outUsed   [in]: \ref SAES_FUNCTION_ACTIVE when the output channel runs
+ * \param chunkSize [in]: Byte count of the chunk (scales the bound of the wait)
+ * \return \ref SAES_REQUEST_OK at the end of the chunk without an error, \ref SAES_REQUEST_ERROR on a Gpdma error,
+ *         an error flag of the SAES or the timeout
+ */
+static sAes_RequestState_t SAes_Wait_Dma( sAes_FunctionState_t outUsed, sAes_DataLen_t chunkSize )
+{
+    sAes_RequestState_t retState = SAES_REQUEST_ERROR;
+    const uint32_t      waitCnt  = ( ( chunkSize / SAES_BLOCK_BYTES ) * SAES_DMA_WAIT_PER_BLOCK_RAW );
+
+    for( uint32_t iterationCnt = 0u; waitCnt > iterationCnt; iterationCnt++ )
+    {
+        sAes_FunctionState_t doneState = sAes_Runtime.DmaInDone;
+
+        if( SAES_FUNCTION_ACTIVE == outUsed )
+        {
+            doneState = sAes_Runtime.DmaOutDone;
+        }
+        else
+        {
+            /* Header phase: the input channel ends the chunk */
+        }
+
+        if( SAES_FUNCTION_ACTIVE == sAes_Runtime.DmaError )
+        {
+            retState = SAES_REQUEST_ERROR;
+            break;
+        }
+        else if( SAES_FUNCTION_ACTIVE == doneState )
+        {
+            retState = SAES_REQUEST_OK;
+            break;
+        }
+        else
+        {
+            /* The chunk is still being moved */
+        }
+    }
+
+    if( ( SAES_REQUEST_OK        == retState ) &&
+        ( SAES_FUNCTION_INACTIVE == outUsed  )    )
+    {
+        const sAes_RegWaitResult_t busyResult = SAes_Reg_Wait_BusyCleared();
+
+        retState = SAes_Calc_RequestFromWait( busyResult );
+    }
+    else
+    {
+        /* Payload: the output channel read the last block, its processing is over */
+    }
+
+    if( SAES_REQUEST_OK == retState )
+    {
+        const sAes_XferError_t xferError = SAes_Reg_Get_XferError();
+
+        if( SAES_XFER_ERROR_NONE != xferError )
+        {
+            sAes_Runtime.LastXferError = xferError;
+            retState                   = SAES_REQUEST_ERROR;
+        }
+        else
+        {
+            /* No key / read-write / RNG error of the SAES */
+        }
+    }
+    else
+    {
+        /* The chunk already failed */
+    }
+
+    return ( retState );
+}
+
+
+/**
+ * \brief Transfer complete interrupt of the input channel of the DMA mode.
+ */
+static void SAes_DmaInCompleteIsr( void )
+{
+    sAes_Runtime.DmaInDone = SAES_FUNCTION_ACTIVE;
+}
+
+
+/**
+ * \brief Transfer complete interrupt of the output channel of the DMA mode.
+ */
+static void SAes_DmaOutCompleteIsr( void )
+{
+    sAes_Runtime.DmaOutDone = SAES_FUNCTION_ACTIVE;
+}
+
+
+/**
+ * \brief Error interrupt of both channels of the DMA mode: the running chunk fails.
+ *
+ * \param errMask [in]: Gpdma errors (not distinguished)
+ */
+static void SAes_DmaErrorIsr( gpdma_ErrorMaskId_t errMask )
+{
+    (void)errMask;
+
+    sAes_Runtime.DmaError = SAES_FUNCTION_ACTIVE;
 }
 
 #endif /* SAES */

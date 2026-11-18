@@ -17,6 +17,7 @@
 #define SAES_SAES_TYPES_H
 /* ============================== INCLUDES ================================== */
 #include "stdint.h"                         /* Standard integer types         */
+#include "Gpdma_Port.h"                     /* Gpdma types of the DMA mode    */
 /* ========================== SYMBOLIC CONSTANTS ============================ */
 
 /** Null pointer definition */
@@ -201,6 +202,10 @@ typedef void (*sAes_ErrorCallback_t)( sAes_XferError_t error );
 typedef struct
 {
     sAes_XferMode_t         XferMode;         /**< POLL (served by SAes_Task), ISR or DMA */
+    gpdma_PeriphId_t        DmaPeriphId;      /**< Gpdma controller (DMA mode only)       */
+    gpdma_ChannelId_t       DmaInChannelId;   /**< Channel memory -> SAES_DINR (DMA mode) */
+    gpdma_ChannelId_t       DmaOutChannelId;  /**< Channel SAES_DOUTR -> memory (DMA mode) */
+    gpdma_Priority_t        DmaChannelPrio;   /**< Priority of both channels (DMA mode)   */
     sAes_IrqPrio_t          IrqPriority;      /**< NVIC priority used in ISR / DMA mode   */
     sAes_CompleteCallback_t CompleteCallback; /**< Called when a request finishes         */
     sAes_ErrorCallback_t    ErrorCallback;    /**< Called on an asynchronous HW error     */

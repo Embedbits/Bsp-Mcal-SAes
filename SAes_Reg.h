@@ -100,6 +100,10 @@ void                        SAes_Reg_Clear_AllFlags     ( void );
 
 sAes_XferError_t            SAes_Reg_Get_XferError      ( void );
 
+void                        SAes_Reg_Set_DmaRequests    ( sAes_FunctionState_t inState, sAes_FunctionState_t outState );
+uint32_t                    SAes_Reg_Get_DinAddr        ( void );
+uint32_t                    SAes_Reg_Get_DoutAddr       ( void );
+
 /* ------------------------------- Data access -------------------------------- */
 
 void                        SAes_Reg_Write_Key          ( const sAes_Data_t * const keyBytes,

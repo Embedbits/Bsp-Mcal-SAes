@@ -33,6 +33,7 @@ set( SAes_PublicHeaders
 # List of dependent libraries that are publicly used by the current library
 set( SAes_PublicDependentLibs
     Ral_Lib
+    Gpdma_Lib
 )
 
 
